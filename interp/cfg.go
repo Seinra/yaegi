@@ -3256,21 +3256,96 @@ func compositeGenerator(n *node, typ *itype, rtyp reflect.Type) (gen bltnGenerat
 	return gen
 }
 
+// embeddedFieldNames returns the reflect field names which correspond to
+// embedded struct fields of an interpreted struct type. Interpreted struct
+// types built by refType mark Anonymous only for single-field structs
+// (golang/go#15924 workaround, see type.go), so multi-field holders report
+// Anonymous == false even for genuinely embedded fields; the itype embed
+// flags (set at source level) stay correct. Both the source name and its
+// exported (reflect) form are collected, as unexported embedded fields are
+// stored mangled by exportName. It returns nil when t does not resolve to
+// an interpreted struct type (e.g. binary types, whose Anonymous flags are
+// trustworthy, or interfaces), in which case callers fall back to the
+// reflect-only rule.
+func embeddedFieldNames(t *itype) map[string]bool {
+	for t != nil && (t.cat == ptrT || t.cat == linkedT) {
+		t = t.val
+	}
+	if t == nil || t.cat != structT {
+		return nil
+	}
+	names := map[string]bool{}
+	for _, f := range t.field {
+		if !f.embed {
+			continue
+		}
+		names[f.name] = true
+		names[exportName(f.name)] = true
+		if n, ok := strings.CutPrefix(f.name, "*"); ok {
+			names[n] = true
+			names[exportName(n)] = true
+		}
+	}
+	return names
+}
+
+// fieldItype returns the itype of the i-th struct field when the reflect
+// field order matches the itype field order, or nil otherwise (order
+// mismatch, or no itype guidance at this level). A nil result makes the
+// walker fall back to the reflect-only rule for that field's subtree.
+func fieldItype(ftyps []*itype, i int) *itype {
+	if ftyps == nil || i < 0 || i >= len(ftyps) {
+		return nil
+	}
+	return ftyps[i]
+}
+
+// isEmbeddedFieldName is the reflect-only fallback for levels without
+// itype guidance (binary or unknown types, whose Anonymous flags are
+// trustworthy). It matches the Go rule that an embedded field's name is
+// its type base name (also trying the exported form, as unexported
+// interpreted fields are stored mangled by exportName). It only runs where
+// the type checker already resolved a promoted method expression, so a
+// same-named explicit field cannot falsely match (it would collide with
+// the embedded one).
+func isEmbeddedFieldName(f reflect.StructField) bool {
+	if f.Anonymous {
+		return true
+	}
+	t := f.Type
+	for t.Kind() == reflect.Ptr {
+		t = t.Elem()
+	}
+	name := t.Name()
+	if name == "" {
+		return false
+	}
+	return f.Name == name || f.Name == exportName(name)
+}
+
 // digPromoted resolves the promoted receiver of a method expression.
 // When the method is declared on an embedded field, the first call argument
 // carries the outer value while the interpreter frame expects the embedded
 // one, so the outer value is searched for an embedded field assignable to
-// the receiver type. It reports ok == false when no promoted receiver is
-// found, in which case the caller keeps the historical binding behavior.
-func digPromoted(src reflect.Value, recv reflect.Type) (reflect.Value, bool) {
+// the receiver type. The outer itype (from the method expression type)
+// guides the search: its source-level embed flags stay correct even when
+// the reflect Anonymous flags do not (see embeddedFieldNames). It reports
+// ok == false when no promoted receiver is found, in which case the caller
+// keeps the historical binding behavior.
+func digPromoted(src reflect.Value, recv reflect.Type, outer *itype) (reflect.Value, bool) {
 	if !src.IsValid() || recv == nil || src.Type().AssignableTo(recv) {
 		return src, true
 	}
+	type candidate struct {
+		v reflect.Value
+		t *itype
+	}
 	seen := map[reflect.Type]bool{}
-	queue := []reflect.Value{src}
+	queue := []candidate{{src, outer}}
 	for len(queue) > 0 && len(seen) < 64 {
-		v := queue[0]
+		c := queue[0]
 		queue = queue[1:]
+		v := c.v
 		for v.Kind() == reflect.Interface && !v.IsNil() {
 			v = v.Elem()
 		}
@@ -3288,6 +3363,16 @@ func digPromoted(src reflect.Value, recv reflect.Type) (reflect.Value, bool) {
 		if v.CanAddr() && v.Addr().Type().AssignableTo(recv) {
 			return v.Addr(), true
 		}
+		// Dereference pointer chains: a *Inner field promotes to an Inner
+		// value receiver by dereferencing. Elem of a non-nil pointer is
+		// addressable, so the result stays bindable.
+		dd := v
+		for dd.Kind() == reflect.Ptr && !dd.IsNil() {
+			dd = dd.Elem()
+			if dd.Type().AssignableTo(recv) {
+				return dd, true
+			}
+		}
 		t := v.Type()
 		if seen[t] {
 			continue
@@ -3303,10 +3388,42 @@ func digPromoted(src reflect.Value, recv reflect.Type) (reflect.Value, bool) {
 		if d.Kind() != reflect.Struct {
 			continue
 		}
+		// Itypes of nested levels follow the field declarations when the
+		// reflect field order matches; otherwise that level falls back to
+		// the reflect-only rule.
+		tt := c.t
+		for tt != nil && (tt.cat == ptrT || tt.cat == linkedT) {
+			tt = tt.val
+		}
+		var names map[string]bool
+		var ftyps []*itype
+		if tt != nil && tt.cat == structT {
+			names = embeddedFieldNames(tt)
+			if len(tt.field) == d.NumField() {
+				ftyps = make([]*itype, len(tt.field))
+				for i := range tt.field {
+					ftyps[i] = tt.field[i].typ
+				}
+			}
+		}
 		dt := d.Type()
 		for i := 0; i < dt.NumField(); i++ {
-			if dt.Field(i).Anonymous {
-				queue = append(queue, d.Field(i))
+			f := dt.Field(i)
+			if f.Anonymous {
+				queue = append(queue, candidate{d.Field(i), fieldItype(ftyps, i)})
+				continue
+			}
+			if names != nil {
+				if names[f.Name] {
+					queue = append(queue, candidate{d.Field(i), fieldItype(ftyps, i)})
+				}
+				continue
+			}
+			// No itype guidance at this level (binary or unknown type):
+			// Anonymous is trustworthy there; keep the historical
+			// name fallback for robustness.
+			if isEmbeddedFieldName(f) {
+				queue = append(queue, candidate{d.Field(i), nil})
 			}
 		}
 	}
@@ -3343,7 +3460,11 @@ func getMethodExpr(n *node) {
 				}
 				src = vs.value
 			}
-			if dug, ok := digPromoted(src, recv.Type()); ok {
+			var outer *itype
+			if len(n.typ.arg) > 0 {
+				outer = n.typ.arg[0]
+			}
+			if dug, ok := digPromoted(src, recv.Type(), outer); ok {
 				src = dug
 			}
 			sk, dk := src.Kind(), recv.Kind()
@@ -3351,6 +3472,15 @@ func getMethodExpr(n *node) {
 			case sk == reflect.Ptr && dk != reflect.Ptr:
 				recv.Set(src.Elem())
 			case sk != reflect.Ptr && dk == reflect.Ptr:
+				// Interior-defensive copy (native R3-001): no compiling
+				// program is known to reach this branch — direct call
+				// syntax with a non-addressable value for a pointer
+				// receiver is rejected identically to gc at compile time
+				// (valarg/guardreach probes) — but the pre-guard trim
+				// turned a wrapper-forwarded temporary into a loud host
+				// panic, so the guard stays. Do not trim: silent copies
+				// are worse than loud failures, and removing this
+				// resurrects the host panic.
 				if !src.CanAddr() {
 					tmp := reflect.New(src.Type())
 					tmp.Elem().Set(src)

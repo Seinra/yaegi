@@ -3039,7 +3039,12 @@ var rangeFuncMark bltn = func(*frame) bltn { return nil }
 // rangeFuncEscape is returned by wrapped loop escapes (see markRangeFlow)
 // to signal that the body left the loop. The escape target is recorded in
 // the per-execution rangeFuncState. Stable package level value, recognized
-// by pointer, never invoked.
+// by pointer, never invoked. Its body must stay textually distinct from
+// rangeFuncMark above: both sentinels are recognized by code pointer, so a
+// toolchain which merged the two identical literals would silently alias
+// iteration-end and loop-escape. The rangefunc corpus (break, continue,
+// goto, return shapes) pins correct loop control, and rangeFunc asserts
+// the distinction at setup so aliasing fails loudly instead of silently.
 var rangeFuncEscape bltn = func(*frame) bltn { return nil }
 
 // rangeFuncState carries per loop execution control flow across the
@@ -3081,13 +3086,30 @@ func rangeFunc(rangeNode *node) {
 	}
 	markPtr := reflect.ValueOf(rangeFuncMark).Pointer()
 	escapePtr := reflect.ValueOf(rangeFuncEscape).Pointer()
+	if markPtr == escapePtr {
+		// A merged-literal toolchain aliased the two sentinels; loop
+		// control (mark vs escape) would silently misbehave. Fail here,
+		// loudly, instead of corrupting every range-over-func loop.
+		panic("yaegi: rangeFunc sentinels are aliased (mark == escape), loop control would silently misbehave")
+	}
 	// The loop state slot was added in the range CFG case just before the
-	// key slot, mirroring the rangeMap iterator slot convention.
+	// key slot (sc.add(rangeFuncStateType()) precedes the key sc.add),
+	// mirroring the rangeMap iterator slot convention. The slot holds an
+	// interpreter-internal *rangeFuncState; no guest syntax addresses it,
+	// so a direct-syntax kill test is impossible and the exec-site
+	// assertion below is the regression lock (interior-guard rule).
 	stateIndex := rangeNode.child[0].findex - 1
 	loopExec := func(loopFrame *frame) bltn {
 		seq := seqValue(loopFrame)
 		yieldType := seq.Type().In(0)
-		loopState := loopFrame.data[stateIndex].Interface().(*rangeFuncState)
+		sv := loopFrame.data[stateIndex]
+		if !sv.IsValid() {
+			panic("yaegi: rangeFunc state slot holds no value (child[0].findex-1 layout broken)")
+		}
+		loopState, ok := sv.Interface().(*rangeFuncState)
+		if !ok {
+			panic("yaegi: rangeFunc state slot corrupted (child[0].findex-1 layout broken)")
+		}
 		yield := reflect.MakeFunc(yieldType, func(yieldArgs []reflect.Value) []reflect.Value {
 			if len(yieldArgs) > 0 {
 				loopFrame.data[keyIndex].Set(yieldArgs[0])
