@@ -3256,6 +3256,70 @@ func compositeGenerator(n *node, typ *itype, rtyp reflect.Type) (gen bltnGenerat
 	return gen
 }
 
+// getMethodExpr generates the value of a method expression, i.e. a method
+// used as a function with the receiver passed as first argument
+// (e.g. (*T).M). It mirrors genFunctionWrapper, except that the receiver
+// is bound from the first call argument rather than from a receiver node.
+func getMethodExpr(n *node) {
+	i := n.findex
+	l := n.level
+	next := getExec(n.tnext)
+	def := n.val.(*node)
+	start := def.child[3].start
+	numRet := len(def.typ.ret)
+	funcType := n.typ.TypeOf()
+	n.exec = func(f *frame) bltn {
+		getFrame(f, l).data[i] = reflect.MakeFunc(funcType, func(in []reflect.Value) []reflect.Value {
+			// Allocate and init local frame. All values to be settable and addressable.
+			fr := newFrame(f, len(def.types), f.runid())
+			d := fr.data
+			for i, t := range def.types {
+				d[i] = reflect.New(t).Elem()
+			}
+			// Bind the method expression first argument as the receiver.
+			recv := d[numRet]
+			src := in[0]
+			for {
+				vs, ok := src.Interface().(valueInterface)
+				if !ok {
+					break
+				}
+				src = vs.value
+			}
+			sk, dk := src.Kind(), recv.Kind()
+			switch {
+			case sk == reflect.Ptr && dk != reflect.Ptr:
+				recv.Set(src.Elem())
+			case sk != reflect.Ptr && dk == reflect.Ptr:
+				recv.Set(src.Addr())
+			default:
+				recv.Set(src)
+			}
+			d = d[numRet+1:]
+			// Copy function input arguments in local frame.
+			for i, arg := range in[1:] {
+				if i >= len(d) {
+					// In case of unused arg, there may be not even a frame entry allocated, just skip.
+					break
+				}
+				typ := def.typ.arg[i]
+				switch {
+				case isEmptyInterface(typ) || typ.TypeOf() == valueInterfaceType:
+					d[i].Set(arg)
+				case isInterfaceSrc(typ):
+					d[i].Set(reflect.ValueOf(valueInterface{value: arg.Elem()}))
+				default:
+					d[i].Set(arg)
+				}
+			}
+			// Interpreter code execution.
+			runCfg(start, fr, def, n)
+			return fr.data[:numRet]
+		})
+		return next
+	}
+}
+
 // matchSelectorMethod, given that n represents a selector for a method, tries
 // to find the corresponding method, and populates n accordingly.
 func matchSelectorMethod(sc *scope, n *node) (err error) {
@@ -3333,11 +3397,15 @@ func matchSelectorMethod(sc *scope, n *node) (err error) {
 		if n.child[0].isType(sc) {
 			// Handle method as a function with receiver in 1st argument.
 			n.val = m
-			n.findex = notInFrame
-			n.gen = nop
+			n.gen = getMethodExpr
 			n.typ = &itype{}
 			*n.typ = *m.typ
 			n.typ.arg = append([]*itype{n.child[0].typ}, m.typ.arg...)
+			// The expression denotes a plain function: drop the method
+			// receiver marker and any cached reflect type, so the
+			// prepended receiver argument is honored.
+			n.typ.recv = nil
+			n.typ.rtype = nil
 		} else {
 			// Handle method with receiver.
 			n.gen = getMethod
