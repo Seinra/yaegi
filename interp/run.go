@@ -428,10 +428,18 @@ func typeAssert(n *node, withResult, withOk bool) {
 				v = val.value
 				leftType = val.node.typ.rtype
 			} else {
-				if v.IsValid() && !canAssertTypes(v.Type(), rtype) {
+				// Unwrap only a non-nil interface value which does not already
+				// satisfy the assertion. Concrete values assert directly (Elem
+				// would panic on them), and a nil interface (or invalid value)
+				// is normalized below so the assertion fails, as in gc.
+				if v.IsValid() && v.Kind() == reflect.Interface && !v.IsNil() && !canAssertTypes(v.Type(), rtype) {
 					v = v.Elem()
 				}
-				leftType = v.Type()
+				if v.IsValid() && (v.Kind() != reflect.Interface || !v.IsNil()) {
+					leftType = v.Type()
+				} else {
+					v = reflect.Value{}
+				}
 				ok = true
 			}
 			ok = v.IsValid()
@@ -493,7 +501,13 @@ func typeAssert(n *node, withResult, withOk bool) {
 		}
 	case n.child[0].typ.cat == valueT || n.child[0].typ.cat == errorT:
 		n.exec = func(f *frame) bltn {
-			v := value(f).Elem()
+			v := value(f)
+			// Unwrap only interface values. Concrete values (e.g. an
+			// interpreted struct stored raw in an error frame) assert
+			// directly; Elem would panic on them.
+			if v.IsValid() && v.Kind() == reflect.Interface {
+				v = v.Elem()
+			}
 			ok := v.IsValid()
 			if setStatus {
 				defer func() {

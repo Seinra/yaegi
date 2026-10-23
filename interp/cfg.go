@@ -1042,6 +1042,30 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 				// A function indexed by a type means an instantiated generic function.
 				c1 := n.child[1]
 				if !c1.isType(sc) {
+					if isGeneric(t) {
+						// An explicit type argument which can never denote a type
+						// is rejected now, as gc does, rather than silently
+						// ignored in favor of inference. Unresolved identifiers
+						// keep the lenient path: they may be type parameters
+						// resolved at instantiation, and undefined names are
+						// reported downstream.
+						switch {
+						case c1.kind == identExpr:
+							if sym, _, found := sc.lookup(c1.ident); found && sym.kind != typeSym {
+								err = c1.cfgErrorf("%s is not a type", c1.ident)
+								return
+							}
+						case c1.kind == basicLit:
+							err = c1.cfgErrorf("%s is not a type", c1.ident)
+							return
+						case c1.kind == selectorExpr:
+							// Note: qualified names (pkg.Name) are intentionally not
+							// rejected here. Package symbols are not visible in the
+							// scope at this point (probed: math/fmt absent), so they
+							// can not be distinguished from valid qualified type
+							// arguments, which rely on the lenient path below.
+						}
+					}
 					n.typ = t
 					return
 				}
