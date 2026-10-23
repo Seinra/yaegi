@@ -1982,11 +1982,6 @@ type refTypeContext struct {
 	// whole recursion is fully resolved, and the type is fixed.
 	refs map[string][]*itype
 
-	// When we detect for the first time that we are in a recursive type (thanks to
-	// defined), we keep track of the first occurrence of the type where the recursion
-	// started, so we can restart the last step that fixes all the types from the same
-	// "top-level" point.
-	rect       *itype
 	rebuilding bool
 	slevel     int
 }
@@ -2003,42 +1998,6 @@ func (c *refTypeContext) isComplete() bool {
 		}
 	}
 	return true
-}
-
-func (t *itype) fixDummy(typ reflect.Type) reflect.Type {
-	if typ == unsafe2.DummyType {
-		return t.rtype
-	}
-	switch typ.Kind() {
-	case reflect.Array:
-		return reflect.ArrayOf(typ.Len(), t.fixDummy(typ.Elem()))
-	case reflect.Chan:
-		return reflect.ChanOf(typ.ChanDir(), t.fixDummy(typ.Elem()))
-	case reflect.Func:
-		in := make([]reflect.Type, typ.NumIn())
-		for i := range in {
-			in[i] = t.fixDummy(typ.In(i))
-		}
-		out := make([]reflect.Type, typ.NumOut())
-		for i := range out {
-			out[i] = t.fixDummy(typ.Out(i))
-		}
-		return reflect.FuncOf(in, out, typ.IsVariadic())
-	case reflect.Map:
-		return reflect.MapOf(t.fixDummy(typ.Key()), t.fixDummy(typ.Elem()))
-	case reflect.Ptr:
-		return reflect.PtrTo(t.fixDummy(typ.Elem()))
-	case reflect.Slice:
-		return reflect.SliceOf(t.fixDummy(typ.Elem()))
-	case reflect.Struct:
-		fields := make([]reflect.StructField, typ.NumField())
-		for i := range fields {
-			fields[i] = typ.Field(i)
-			fields[i].Type = t.fixDummy(fields[i].Type)
-		}
-		return reflect.StructOf(fields)
-	}
-	return typ
 }
 
 // RefType returns a reflect.Type representation from an interpreter type.
@@ -2080,7 +2039,6 @@ func (t *itype) refType(ctx *refTypeContext) reflect.Type {
 		// To indicate that a rebuild is needed on the englobing struct,
 		// return a dummy field type and create an empty entry.
 		flds := ctx.refs[name]
-		ctx.rect = dt
 
 		// We know we are used as a field by someone, but we don't know by who
 		// at this point in the code, so we just mark it as an empty *itype for now.
@@ -2178,7 +2136,15 @@ func (t *itype) refType(ctx *refTypeContext) reflect.Type {
 				for i := 0; i < s.rtype.NumField(); i++ {
 					f := s.rtype.Field(i)
 					if strings.HasSuffix(f.Type.String(), "unsafe2.dummy") {
-						unsafe2.SetFieldType(s.rtype, i, ctx.rect.fixDummy(s.rtype.Field(i).Type))
+						// The dummy stands for the field's own declared type, which is
+						// now complete (isComplete gate above), so resolve it from the
+						// field itype. Dummies in flight may belong to different
+						// ancestors of the same recursion web, so the owner must come
+						// from the field itself: patching with any other in-flight type
+						// builds an illegal by-value cycle which overflows the host
+						// stack in reflect type construction (fatal). See odd task T8.
+						ftyp := s.field[i].typ.refType(&refTypeContext{defined: ctx.defined, rebuilding: true})
+						unsafe2.SetFieldType(s.rtype, i, ftyp)
 						if name == s.path+"/"+s.name {
 							fieldFix = append(fieldFix, fixStructField{s.name, i})
 						}
