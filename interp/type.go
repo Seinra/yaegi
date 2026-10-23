@@ -2170,7 +2170,7 @@ func (t *itype) refType(ctx *refTypeContext) reflect.Type {
 		}
 		fieldFix := []fixStructField{} // Slice of field indices to fix for recursivity.
 		t.rtype = reflect.StructOf(fields)
-		if t.name != "" && t.path != "" {
+		if t.name != "" && t.path != "" && len(fields) > 0 {
 			t.rtype = unsafe2.NamedStructOf(t.rtype, t.path, t.name)
 		}
 		if ctx.isComplete() {
