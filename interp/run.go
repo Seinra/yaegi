@@ -1987,7 +1987,14 @@ func getMethodByName(n *node) {
 			}
 			for i := 0; i < val0.NumField(); i++ {
 				fld := val0.Type().Field(i)
-				if !fld.Anonymous || !fld.IsExported() {
+				// Note: do not filter on fld.Anonymous. Struct reflect types built
+				// in refType mark Anonymous only for single-field structs (see
+				// type.go, golang/go#15924 workaround), so multi-field holders
+				// of an embedded interface (e.g. holder{Tag, Namer}) report
+				// Anonymous == false. The CFG already gated this dispatch on
+				// promoted (embedded) methods, so any exported valueInterface
+				// field is a valid candidate here.
+				if !fld.IsExported() {
 					continue
 				}
 				if val, ok = val0.Field(i).Interface().(valueInterface); ok {
