@@ -1,0 +1,27 @@
+# Fork CI: self-hosted gate for the Catalyst-oriented yaegi fork.
+# Runs on the repo-local runner registered per the dispatcher pattern:
+# one self-hosted runner per Seinra repo (actions-runner-dispatcher.ps1).
+name: fork-ci
+
+on:
+  push:
+    branches: [master, fork-a-reflect]
+  pull_request:
+
+jobs:
+  gate:
+    runs-on: [self-hosted, windows]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: go version
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Blocker A tests
+        run: go test ./internal/unsafe2 -count=1
+
+      - name: Blocker B tests
+        run: go test ./interp -run 'TestGenericFunc' -count=1
