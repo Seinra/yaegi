@@ -3216,6 +3216,12 @@ func setExec(n *node) {
 			}
 		}
 		if n.gen == nil {
+			// Last-resort guard: every cfg path is expected to set gen
+			// (many intentionally to nop, e.g. const-folded nodes), so
+			// reaching here means a node kind without a generator. Keep
+			// exec defined via nop rather than failing loud, so the CFG
+			// walk never dereferences a nil exec. Pinned by
+			// TestSetExecNilGenFallback.
 			n.gen = nop
 		}
 		n.gen(n)

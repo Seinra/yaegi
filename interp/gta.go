@@ -236,7 +236,12 @@ func (interp *Interpreter) gta(root *node, rpath, importPath, pkgName string) ([
 				case ".": // import symbols in current scope
 					for n, v := range pkg {
 						if gf, ok := v.Interface().(GenericFunc); ok {
-							samePath := strings.HasSuffix(ipath, importPath)
+							// Skip recompiling generics only when the dot-imported
+							// package is the one being compiled (e.g. the Use
+							// synthetic wrapper). Require a path-segment boundary
+							// so packages which merely share a name suffix
+							// (example.com/amain vs main) still get compiled.
+							samePath := ipath == importPath || strings.HasSuffix(ipath, "/"+importPath)
 							if !samePath {
 								if _, cerr := interp.Compile(string(gf)); cerr != nil {
 									err = cerr
