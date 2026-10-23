@@ -1952,10 +1952,13 @@ func lookupFieldOrMethod(t *itype, name string) *itype {
 		return t.fieldSeq(seq)
 	default:
 		n, _ := t.lookupMethod(name)
-		if n == nil {
-			return nil
+		if n != nil {
+			return n.typ
 		}
-		return n.typ
+		// Promoted methods from an embedded interface are declared as
+		// interface fields, not as concrete methods, so lookupMethod
+		// misses them. Fall back to the embedded interface method set.
+		return t.interfaceMethod(name)
 	}
 }
 
