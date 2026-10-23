@@ -8,3 +8,7 @@ internal/cmd/extract/extract
 example/inception/inception
 _test/tmp/
 /dist
+.crystallize/
+.codegraph/
+.zvec-grep/
+.atl/
