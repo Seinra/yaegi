@@ -3351,16 +3351,12 @@ func getMethodExpr(n *node) {
 			case sk == reflect.Ptr && dk != reflect.Ptr:
 				recv.Set(src.Elem())
 			case sk != reflect.Ptr && dk == reflect.Ptr:
-				if src.CanAddr() {
-					recv.Set(src.Addr())
-				} else {
-					// The value is not addressable (e.g. a temporary
-					// forwarded through the wrapper), so copy it to an
-					// addressable slot before taking its address.
+				if !src.CanAddr() {
 					tmp := reflect.New(src.Type())
 					tmp.Elem().Set(src)
-					recv.Set(tmp)
+					src = tmp.Elem()
 				}
+				recv.Set(src.Addr())
 			default:
 				recv.Set(src)
 			}
