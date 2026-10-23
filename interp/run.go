@@ -3014,6 +3014,143 @@ func rangeMap(n *node) {
 	}
 }
 
+// rangeFunc executes a range-over-func loop (Go 1.23+ iterator sequence).
+// The sequence is called once with a yield function; each yield sets the
+// loop variables and steps the loop body chain inline, so iteration stays
+// lazy (breaking early never pulls further values) and control flow
+// (break, continue, goto, return) behaves as in compiled code:
+//   - a step returning the loop back edge marks one completed iteration and
+//     resumes the sequence (yield returns true);
+//   - any other step is a loop escape recorded by yield (returning false to
+//     stop the sequence) and replayed once the sequence call returns.
+//
+// rangeFuncMark is returned by wrapped loop back edges (see rangeFunc) to
+// signal one completed body iteration. It is a stable package level value,
+// recognized by pointer, and never invoked.
+var rangeFuncMark bltn = func(*frame) bltn { return nil }
+
+// rangeFuncEscape is returned by wrapped loop escapes (see markRangeFlow)
+// to signal that the body left the loop. The escape target is recorded in
+// the per-execution rangeFuncState. Stable package level value, recognized
+// by pointer, never invoked.
+var rangeFuncEscape bltn = func(*frame) bltn { return nil }
+
+// rangeFuncState carries per loop execution control flow across the
+// sequence call boundary. The escape target replays once the sequence
+// returns: the loop exit for break, the label for goto, nil for return.
+type rangeFuncState struct {
+	escaped      bool
+	escapeTarget bltn
+}
+
+// rangeFuncStateType returns the interpreter type of a rangeFuncState slot.
+func rangeFuncStateType() *itype {
+	return valueTOf(reflect.TypeOf((*rangeFuncState)(nil)))
+}
+func rangeFunc(rangeNode *node) {
+	var keyIndex, valIndex int
+	var seqNode *node
+	hasValue := false
+	if len(rangeNode.child) == 4 {
+		keyIndex = rangeNode.child[0].findex
+		seqNode = rangeNode.child[2]
+		if rangeNode.child[1].ident != "_" {
+			valIndex = rangeNode.child[1].findex
+			hasValue = true
+		}
+	} else {
+		keyIndex = rangeNode.child[0].findex
+		seqNode = rangeNode.child[1]
+	}
+	seqValue := genFuncValue(seqNode)
+	bodyEntry := rangeNode.tnext
+	bodyStart := getExec(bodyEntry)
+	loopExit := getExec(rangeNode.fnext)
+	var bodyNode *node
+	if len(rangeNode.child) == 4 {
+		bodyNode = rangeNode.child[3]
+	} else {
+		bodyNode = rangeNode.child[2]
+	}
+	markPtr := reflect.ValueOf(rangeFuncMark).Pointer()
+	escapePtr := reflect.ValueOf(rangeFuncEscape).Pointer()
+	// The loop state slot was added in the range CFG case just before the
+	// key slot, mirroring the rangeMap iterator slot convention.
+	stateIndex := rangeNode.child[0].findex - 1
+	loopExec := func(loopFrame *frame) bltn {
+		seq := seqValue(loopFrame)
+		yieldType := seq.Type().In(0)
+		loopState := loopFrame.data[stateIndex].Interface().(*rangeFuncState)
+		yield := reflect.MakeFunc(yieldType, func(yieldArgs []reflect.Value) []reflect.Value {
+			if len(yieldArgs) > 0 {
+				loopFrame.data[keyIndex].Set(yieldArgs[0])
+				if hasValue && len(yieldArgs) > 1 {
+					loopFrame.data[valIndex].Set(yieldArgs[1])
+				}
+			}
+			step := bodyStart
+			curNode := bodyEntry
+			for step != nil && loopFrame.runid() == rangeNode.interp.runid() {
+				next := step(loopFrame)
+				if next == nil {
+					loopState.escaped = true // function return, replayed as nil below
+					return []reflect.Value{reflect.ValueOf(false)}
+				}
+				if reflect.ValueOf(next).Pointer() == markPtr {
+					return []reflect.Value{reflect.ValueOf(true)}
+				}
+				if reflect.ValueOf(next).Pointer() == escapePtr {
+					return []reflect.Value{reflect.ValueOf(false)}
+				}
+				// Advance node tracking alongside the exec chain, as in runCfg.
+				var nextNode *node
+				switch {
+				case isExecNode(curNode.tnext, next):
+					nextNode = curNode.tnext
+				case isExecNode(curNode.fnext, next):
+					nextNode = curNode.fnext
+				default:
+					nextNode = originalExecNode(curNode, next)
+				}
+				inBody := false
+				for parent := nextNode; parent != nil; parent = parent.anc {
+					if parent == bodyNode {
+						inBody = true
+						break
+					}
+				}
+				if inBody {
+					step, curNode = next, nextNode
+					continue
+				}
+				loopState.escaped = true
+				loopState.escapeTarget = next
+				return []reflect.Value{reflect.ValueOf(false)}
+			}
+			loopState.escaped = true // interpreter reset, unwind the sequence
+			return []reflect.Value{reflect.ValueOf(false)}
+		})
+		seq.Call([]reflect.Value{yield})
+		if !loopState.escaped {
+			return loopExit
+		}
+		return loopState.escapeTarget
+	}
+	// Install the loop exec. Back edge sources and escapes in the body were
+	// wrapped by markRangeFlow during setExec, so iteration end and loop
+	// exit arrive as stable markers.
+	rangeNode.exec = loopExec
+
+	// Init sequence: allocate a fresh per-execution state, then chain into
+	// the loop exec. The range expression itself was evaluated once by the
+	// CFG wiring (o.tnext = k.start) before this init.
+	next := rangeNode.exec
+	rangeNode.child[0].exec = func(loopFrame *frame) bltn {
+		loopFrame.data[stateIndex] = reflect.ValueOf(&rangeFuncState{})
+		return next
+	}
+}
+
 func _case(n *node) {
 	tnext := getExec(n.tnext)
 

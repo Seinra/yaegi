@@ -164,6 +164,18 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 							typ = o.typ.val.TypeOf()
 						}
 						switch typ.Kind() {
+						case reflect.Func:
+							// Range over func (Go 1.23+ iterator sequence).
+							sc.add(rangeFuncStateType())
+							yieldParams, ok := seqYieldParams(o.typ)
+							if !ok {
+								err = o.cfgErrorf("cannot range over %s (value of type %s)", rangeSeqName(o), o.typ.id())
+								return false
+							}
+							if ktyp, vtyp, err = rangeIterTypes(sc, o, len(n.anc.child) == 4, k, yieldParams); err != nil {
+								return false
+							}
+							n.anc.gen = rangeFunc
 						case reflect.Map:
 							n.anc.gen = rangeMap
 							ityp := valueTOf(reflect.TypeOf((*reflect.MapIter)(nil)))
@@ -207,6 +219,18 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 						n.anc.gen = rangeInt
 						sc.add(sc.getType("int"))
 						ktyp = sc.getType("int")
+					case funcT:
+						// Range over func (Go 1.23+ iterator sequence).
+						sc.add(rangeFuncStateType())
+						yieldParams, ok := seqYieldParams(o.typ)
+						if !ok {
+							err = o.cfgErrorf("cannot range over %s (value of type %s)", rangeSeqName(o), o.typ.id())
+							return false
+						}
+						if ktyp, vtyp, err = rangeIterTypes(sc, o, len(n.anc.child) == 4, k, yieldParams); err != nil {
+							return false
+						}
+						n.anc.gen = rangeFunc
 					}
 
 					kindex := sc.add(ktyp)
@@ -2915,6 +2939,200 @@ func isRegularCall(n *node) bool {
 	return isCall(n) && n.child[0].typ.cat == funcT
 }
 
+// isRangeFuncLoop reports whether loopNode (a rangeStmt) ranges over a
+// function sequence, i.e. whether the range expression type has the
+// func(yield func(...) bool) shape handled by the rangeFunc generator.
+func isRangeFuncLoop(loopNode *node) bool {
+	var seqNode *node
+	switch len(loopNode.child) {
+	case 4:
+		seqNode = loopNode.child[2]
+	case 3:
+		seqNode = loopNode.child[1]
+	default:
+		return false
+	}
+	if seqNode.typ == nil {
+		return false
+	}
+	_, ok := seqYieldParams(seqNode.typ)
+	return ok
+}
+
+// markRangeFlow wraps loop back edges and loop escapes in range-over-func
+// bodies so the runtime can tell iteration end from loop exit without
+// relying on exec code pointers, which setExec trampolines and nop
+// indirections alias across nodes. It runs inside setExec right after the
+// node generator, hence before any predecessor captures the exec, so the
+// chain always carries wrapped execs. Back edge sources (nodes edged to
+// the loop) return the stable rangeFuncMark; outside-targeted
+// break/continue/goto record their target in the per-execution state slot
+// and return rangeFuncEscape. Nodes inside nested functions, loops or
+// select statements are excluded: their control flow is consumed locally
+// and never surfaces to the outer iteration stepping.
+func markRangeFlow(n *node) {
+	if n.tnext == nil && n.fnext == nil {
+		return
+	}
+	loopNode := rangeFlowLoop(n)
+	if loopNode == nil {
+		return
+	}
+	if n.tnext == loopNode || n.fnext == loopNode {
+		// The loop variable idents (entry initializers, not back edges)
+		// always edge to the loop; excluding them keeps loop entry intact.
+		if n == loopNode.child[0] || (len(loopNode.child) == 4 && n == loopNode.child[1]) {
+			return
+		}
+		if n.exec == nil {
+			return
+		}
+		inner := n.exec
+		n.exec = func(flowFrame *frame) bltn {
+			inner(flowFrame)
+			return rangeFuncMark
+		}
+		return
+	}
+	switch n.kind {
+	case breakStmt, continueStmt, gotoStmt:
+		target := n.tnext
+		if target == nil || !outsideRangeBody(target, loopNode) {
+			return
+		}
+		if n.exec == nil {
+			return
+		}
+		stateIndex := loopNode.child[0].findex - 1
+		inner := n.exec
+		n.exec = func(flowFrame *frame) bltn {
+			escapeTarget := inner(flowFrame)
+			flowFrame.data[stateIndex].Interface().(*rangeFuncState).escaped = true
+			flowFrame.data[stateIndex].Interface().(*rangeFuncState).escapeTarget = escapeTarget
+			return rangeFuncEscape
+		}
+	}
+}
+
+// rangeFlowLoop returns the range-over-func loop node whose body directly
+// contains n, or nil. Ancestor functions, loops and select statements form
+// boundaries: control flow inside them never reaches the outer iteration
+// stepping (inner loops consume it, closures own their frame).
+func rangeFlowLoop(n *node) *node {
+	for parent := n.anc; parent != nil; parent = parent.anc {
+		switch parent.kind {
+		case rangeStmt:
+			if isRangeFuncLoop(parent) {
+				return parent
+			}
+			return nil
+		case forStmt0, forStmt1, forStmt2, forStmt3, forStmt4, forStmt5, forStmt6, forStmt7, forRangeStmt, selectStmt, funcLit, funcDecl:
+			return nil
+		}
+	}
+	return nil
+}
+
+// outsideRangeBody reports whether target lies outside the body block of
+// the given range-over-func loop node.
+func outsideRangeBody(target, loopNode *node) bool {
+	var bodyNode *node
+	if len(loopNode.child) == 4 {
+		bodyNode = loopNode.child[3]
+	} else {
+		bodyNode = loopNode.child[2]
+	}
+	for parent := target; parent != nil; parent = parent.anc {
+		if parent == bodyNode {
+			return false
+		}
+	}
+	return true
+}
+
+// rangeSeqName renders the range expression for diagnostics, falling back
+// to a generic label when the expression has no identifier (e.g. a call).
+func rangeSeqName(seqNode *node) string {
+	if seqNode.ident != "" {
+		return seqNode.ident
+	}
+	return "expression"
+}
+
+// seqYieldParams returns the yield function parameter types if seqType is a
+// range-over-func sequence type, i.e. a func taking a single yield function
+// (itself taking up to 2 params and returning bool) and returning nothing.
+// It handles interpreted func types (funcT) and binary func types (valueT).
+func seqYieldParams(seqType *itype) ([]*itype, bool) {
+	if seqType.cat == funcT {
+		if len(seqType.arg) != 1 || len(seqType.ret) != 0 {
+			return nil, false
+		}
+		yieldType := seqType.arg[0]
+		if yieldType.cat != funcT || len(yieldType.arg) > 2 || len(yieldType.ret) != 1 {
+			return nil, false
+		}
+		yieldResult := yieldType.ret[0]
+		if yieldResult.cat != boolT && !(yieldResult.cat == valueT && yieldResult.rtype.Kind() == reflect.Bool) {
+			return nil, false
+		}
+		return yieldType.arg, true
+	}
+	if seqType.cat == valueT && seqType.rtype.Kind() == reflect.Func {
+		seqReflect := seqType.rtype
+		if seqReflect.NumIn() != 1 || seqReflect.NumOut() != 0 {
+			return nil, false
+		}
+		yieldReflect := seqReflect.In(0)
+		if yieldReflect.Kind() != reflect.Func || yieldReflect.NumIn() > 2 || yieldReflect.NumOut() != 1 {
+			return nil, false
+		}
+		if yieldReflect.Out(0).Kind() != reflect.Bool {
+			return nil, false
+		}
+		yieldParams := make([]*itype, yieldReflect.NumIn())
+		for i := range yieldParams {
+			yieldParams[i] = valueTOf(yieldReflect.In(i))
+		}
+		return yieldParams, true
+	}
+	return nil, false
+}
+
+// rangeIterTypes validates the number of iteration variables against the
+// yield parameter count, following gc: 2 variables require 2 yield params,
+// 1 variable requires at least 1, and ranging a 0-param yield with variables
+// is rejected. A blank single key (including the synthetic one inserted for
+// `for range seq`) counts as zero variables. It returns the key/value
+// iteration types used for the loop variable slots.
+func rangeIterTypes(sc *scope, seqNode *node, twoVars bool, keyNode *node, yieldParams []*itype) (*itype, *itype, error) {
+	numVars := 0
+	switch {
+	case twoVars:
+		numVars = 2
+	case keyNode.ident != "_":
+		numVars = 1
+	}
+	numYield := len(yieldParams)
+	seqName := rangeSeqName(seqNode)
+	seqID := seqNode.typ.id()
+	switch {
+	case numYield == 0 && numVars > 0:
+		return nil, nil, seqNode.cfgErrorf("range over %s (value of type %s) permits no iteration variables", seqName, seqID)
+	case numYield == 1 && numVars > 1:
+		return nil, nil, seqNode.cfgErrorf("range over %s (value of type %s) permits only one iteration variable", seqName, seqID)
+	}
+	keyType := sc.getType("bool") // Dummy slot type for `for range` over a 0-yield sequence.
+	var valType *itype
+	if numYield > 0 {
+		keyType = yieldParams[0]
+	}
+	if twoVars {
+		valType = yieldParams[1]
+	}
+	return keyType, valType, nil
+}
+
 func variadicPos(n *node) int {
 	if len(n.child[0].typ.arg) == 0 {
 		return -1
@@ -2977,6 +3195,7 @@ func setExec(n *node) {
 			n.gen = nop
 		}
 		n.gen(n)
+		markRangeFlow(n)
 	}
 
 	set(n)
