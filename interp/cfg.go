@@ -3256,6 +3256,63 @@ func compositeGenerator(n *node, typ *itype, rtyp reflect.Type) (gen bltnGenerat
 	return gen
 }
 
+// digPromoted resolves the promoted receiver of a method expression.
+// When the method is declared on an embedded field, the first call argument
+// carries the outer value while the interpreter frame expects the embedded
+// one, so the outer value is searched for an embedded field assignable to
+// the receiver type. It reports ok == false when no promoted receiver is
+// found, in which case the caller keeps the historical binding behavior.
+func digPromoted(src reflect.Value, recv reflect.Type) (reflect.Value, bool) {
+	if !src.IsValid() || recv == nil || src.Type().AssignableTo(recv) {
+		return src, true
+	}
+	seen := map[reflect.Type]bool{}
+	queue := []reflect.Value{src}
+	for len(queue) > 0 && len(seen) < 64 {
+		v := queue[0]
+		queue = queue[1:]
+		for v.Kind() == reflect.Interface && !v.IsNil() {
+			v = v.Elem()
+		}
+		if v.CanInterface() {
+			if vs, ok := v.Interface().(valueInterface); ok {
+				v = vs.value
+				if !v.IsValid() {
+					return src, false
+				}
+			}
+		}
+		if v.Type().AssignableTo(recv) {
+			return v, true
+		}
+		if v.CanAddr() && v.Addr().Type().AssignableTo(recv) {
+			return v.Addr(), true
+		}
+		t := v.Type()
+		if seen[t] {
+			continue
+		}
+		seen[t] = true
+		d := v
+		for d.Kind() == reflect.Ptr {
+			if d.IsNil() {
+				break
+			}
+			d = d.Elem()
+		}
+		if d.Kind() != reflect.Struct {
+			continue
+		}
+		dt := d.Type()
+		for i := 0; i < dt.NumField(); i++ {
+			if dt.Field(i).Anonymous {
+				queue = append(queue, d.Field(i))
+			}
+		}
+	}
+	return src, false
+}
+
 // getMethodExpr generates the value of a method expression, i.e. a method
 // used as a function with the receiver passed as first argument
 // (e.g. (*T).M). It mirrors genFunctionWrapper, except that the receiver
@@ -3286,12 +3343,24 @@ func getMethodExpr(n *node) {
 				}
 				src = vs.value
 			}
+			if dug, ok := digPromoted(src, recv.Type()); ok {
+				src = dug
+			}
 			sk, dk := src.Kind(), recv.Kind()
 			switch {
 			case sk == reflect.Ptr && dk != reflect.Ptr:
 				recv.Set(src.Elem())
 			case sk != reflect.Ptr && dk == reflect.Ptr:
-				recv.Set(src.Addr())
+				if src.CanAddr() {
+					recv.Set(src.Addr())
+				} else {
+					// The value is not addressable (e.g. a temporary
+					// forwarded through the wrapper), so copy it to an
+					// addressable slot before taking its address.
+					tmp := reflect.New(src.Type())
+					tmp.Elem().Set(src)
+					recv.Set(tmp)
+				}
 			default:
 				recv.Set(src)
 			}
