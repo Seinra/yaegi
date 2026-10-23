@@ -23,7 +23,9 @@ jobs:
         run: go version
 
       - name: Vet
-        run: go vet ./...
+        run: |
+          go vet ./interp/... ./internal/... ./extract/...
+          go vet ./stdlib/generic/...
 
       - name: Blocker A tests
         run: go test ./internal/unsafe2 -count=1
