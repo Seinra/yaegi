@@ -38,6 +38,9 @@ func (check typecheck) assignment(n *node, typ *itype, context string) error {
 	if n.typ == nil {
 		return n.cfgErrorf("invalid type in %s", context)
 	}
+	if err := check.methodPtrRecv(n); err != nil {
+		return err
+	}
 	if n.typ.untyped {
 		if typ == nil || isInterface(typ) {
 			if typ == nil && n.typ.cat == nilT {
@@ -1005,6 +1008,9 @@ func (check typecheck) arguments(n *node, child []*node, fun *node, ellipsis boo
 		err := fun.cfgErrorf("typecheck arguments: nil function type: likely a syntax error above this point")
 		return err
 	}
+	if err := check.methodPtrRecv(fun); err != nil {
+		return err
+	}
 	var cnt int
 	for i, param := range params {
 		ellip := i == l-1 && ellipsis
@@ -1081,6 +1087,89 @@ func getArgsID(ftyp *itype) string {
 	}
 	res += ")"
 	return res
+}
+
+// methodPtrRecv rejects a method value or method call which requires a
+// pointer receiver on a non-addressable operand, matching gc:
+// "cannot call pointer method M on T". Without this static check the call
+// would silently operate on a copy, losing mutations. Method expressions,
+// binary methods and interface dispatch carry no declared pointer receiver
+// here and are unaffected, as are pointer operands, which never need an
+// addressable value.
+func (check typecheck) methodPtrRecv(s *node) error {
+	if s.action != aGetMethod || s.typ == nil || s.typ.isBinMethod {
+		return nil
+	}
+	recv := s.typ.recv
+	if recv == nil || recv.cat != ptrT {
+		return nil
+	}
+	if len(s.child) < 2 {
+		return nil
+	}
+	op := s.child[0]
+	if op.typ == nil || isPtr(op.typ) {
+		return nil
+	}
+	if isMethodOperandAddressable(op) {
+		return nil
+	}
+	tname := op.typ.name
+	if tname == "" {
+		tname = op.typ.id()
+	}
+	return s.cfgErrorf("cannot call pointer method %s on %s", s.child[1].ident, tname)
+}
+
+// isMethodOperandAddressable reports whether the operand of a selector
+// expression can be addressed, following gc addressability rules: variables,
+// pointer indirections and selectors through pointers are addressable; slice
+// indexing is addressable, array indexing follows its base; map and string
+// indexing, calls, composite literals and other computed values are not.
+func isMethodOperandAddressable(o *node) bool {
+	for o != nil {
+		if o.typ == nil {
+			return true
+		}
+		switch o.kind {
+		case parenExpr:
+			o = o.child[0]
+			continue
+		case identExpr:
+			return !isBlank(o)
+		case starExpr:
+			return true
+		case indexExpr:
+			if len(o.child) == 0 || o.child[0].typ == nil {
+				return false
+			}
+			base := o.child[0].typ
+			if isMap(base) {
+				return false
+			}
+			switch base.TypeOf().Kind() {
+			case reflect.Slice:
+				return true
+			case reflect.Array:
+				o = o.child[0]
+				continue
+			default:
+				return false
+			}
+		case selectorExpr:
+			if len(o.child) == 0 || o.child[0].typ == nil {
+				return false
+			}
+			if isPtr(o.child[0].typ) {
+				return true
+			}
+			o = o.child[0]
+			continue
+		default:
+			return false
+		}
+	}
+	return false
 }
 
 var errCantConvert = errors.New("cannot convert")
