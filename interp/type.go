@@ -2170,6 +2170,9 @@ func (t *itype) refType(ctx *refTypeContext) reflect.Type {
 		}
 		fieldFix := []fixStructField{} // Slice of field indices to fix for recursivity.
 		t.rtype = reflect.StructOf(fields)
+		if t.name != "" && t.path != "" {
+			t.rtype = unsafe2.NamedStructOf(t.rtype, t.path, t.name)
+		}
 		if ctx.isComplete() {
 			for _, s := range ctx.defined {
 				for i := 0; i < s.rtype.NumField(); i++ {
