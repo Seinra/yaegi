@@ -623,7 +623,13 @@ func (check typecheck) typeAssertionExpr(n *node, typ *itype) error {
 			return n.cfgErrorf("impossible type assertion: %s does not implement %s (missing %v method)", typ.id(), n.typ.id(), name)
 		}
 		if tm.recv != nil && tm.recv.TypeOf().Kind() == reflect.Ptr && typ.TypeOf().Kind() != reflect.Ptr {
-			return n.cfgErrorf("impossible type assertion: %s does not implement %s as %q method has a pointer receiver", typ.id(), n.typ.id(), name)
+			// Methods promoted through an embedded pointer belong to the
+			// value method set (as gc implements it: the assertion is then
+			// a dynamic check), so only methods with a direct or
+			// value-promoted pointer receiver stay static errors.
+			if _, index := typ.lookupMethod(name); !promotedThroughPtr(typ, index) {
+				return n.cfgErrorf("impossible type assertion: %s does not implement %s as %q method has a pointer receiver", typ.id(), n.typ.id(), name)
+			}
 		}
 
 		if im.cat != funcT || tm.cat != funcT {
@@ -647,6 +653,33 @@ func (check typecheck) typeAssertionExpr(n *node, typ *itype) error {
 		}
 	}
 	return nil
+}
+
+// promotedThroughPtr reports whether the method found at the given lookup
+// path in typ is promoted through an embedded pointer. gc treats such
+// methods as part of the value method set, so a type assertion to typ is a
+// dynamic check rather than a static error, even if the method is declared
+// with a pointer receiver.
+func promotedThroughPtr(typ *itype, index []int) bool {
+	cur := typ
+	for len(index) > 0 {
+		for cur != nil && cur.cat == linkedT && cur.val != nil {
+			cur = cur.val
+		}
+		if cur == nil || len(cur.field) <= index[0] {
+			return false
+		}
+		ft := cur.field[index[0]].typ
+		for ft != nil && ft.cat == linkedT && ft.val != nil {
+			ft = ft.val
+		}
+		if ft != nil && ft.cat == ptrT {
+			return true
+		}
+		cur = ft
+		index = index[1:]
+	}
+	return false
 }
 
 // conversion type checks the conversion of n to typ.
