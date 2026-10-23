@@ -1,0 +1,61 @@
+// Copyright 2024 The Go Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
+package slices
+
+import (
+	"cmp"
+)
+
+// NOTE(yaegi): Go 1.23+ iterator shapes, ported without the "iter" import
+// seam (the interpreter has no iter stdlib symbols). Sequence parameters
+// use the underlying func(yield func(E) bool) type, which is identical to
+// the underlying type of iter.Seq[E], so values convert implicitly and the
+// T7 range-over-func support executes them. Behavior matches upstream
+// slices/iter.go for the covered symbols.
+
+// AppendSeq appends the values from seq to the slice and
+// returns the extended slice.
+// If seq is empty, the result preserves the nilness of s.
+func AppendSeq[Slice ~[]E, E any](s Slice, seq func(yield func(E) bool)) Slice {
+	for v := range seq {
+		s = append(s, v)
+	}
+	return s
+}
+
+// Collect collects values from seq into a new slice and returns it.
+// If seq is empty, the result is nil.
+func Collect[E any](seq func(yield func(E) bool)) []E {
+	return AppendSeq([]E(nil), seq)
+}
+
+// Sorted collects values from seq into a new slice, sorts the slice,
+// and returns it.
+// If seq is empty, the result is nil.
+func Sorted[E cmp.Ordered](seq func(yield func(E) bool)) []E {
+	s := Collect(seq)
+	Sort(s)
+	return s
+}
+
+// SortedFunc collects values from seq into a new slice, sorts the slice
+// using the comparison function, and returns it.
+// If seq is empty, the result is nil.
+func SortedFunc[E any](seq func(yield func(E) bool), cmp func(E, E) int) []E {
+	s := Collect(seq)
+	SortFunc(s, cmp)
+	return s
+}
+
+// SortedStableFunc collects values from seq into a new slice.
+// It then sorts the slice while keeping the original order of equal elements,
+// using the comparison function to compare elements.
+// It returns the new slice.
+// If seq is empty, the result is nil.
+func SortedStableFunc[E any](seq func(yield func(E) bool), cmp func(E, E) int) []E {
+	s := Collect(seq)
+	SortStableFunc(s, cmp)
+	return s
+}

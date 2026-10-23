@@ -23,6 +23,12 @@ var slicesSource2 string
 //go:embed go1_22_slices_zsortorderedfunc.go.txt
 var slicesSource3 string
 
+//go:embed go1_22_slices_iter.go.txt
+var slicesSource4 string
+
+//go:embed go1_22_maps_iter.go.txt
+var mapsSource1 string
+
 /*
 //go:embed go1_22_sync_oncefunc.go.txt
 var syncSource string
@@ -39,6 +45,8 @@ var Sources = [...]string{
 	slicesSource1,
 	slicesSource2,
 	slicesSource3,
+	slicesSource4,
+	mapsSource1,
 	// FIXME(marc): support the following.
 	// syncAtomicSource,
 	// syncSource,
