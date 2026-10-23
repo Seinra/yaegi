@@ -1059,11 +1059,15 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 							err = c1.cfgErrorf("%s is not a type", c1.ident)
 							return
 						case c1.kind == selectorExpr:
-							// Note: qualified names (pkg.Name) are intentionally not
-							// rejected here. Package symbols are not visible in the
-							// scope at this point (probed: math/fmt absent), so they
-							// can not be distinguished from valid qualified type
-							// arguments, which rely on the lenient path below.
+							// A qualified name which resolves to a non-type symbol
+							// is rejected now, as gc does. Names which do not
+							// resolve stay on the lenient path: they may be type
+							// parameters resolved at instantiation, and undefined
+							// names are reported downstream.
+							if sel := qualifiedNonType(c1, sc); sel != "" {
+								err = c1.cfgErrorf("%s is not a type", sel)
+								return
+							}
 						}
 					}
 					n.typ = t
@@ -2653,6 +2657,49 @@ func getDefault(n *node) int {
 
 func isBinType(v reflect.Value) bool { return v.IsValid() && v.Kind() == reflect.Ptr && v.IsNil() }
 
+// qualifiedNonType reports whether a selector expression used as an
+// explicit generic type argument resolves to a non-type symbol, which gc
+// rejects as "not a type". It returns the qualified name when the
+// selector qualifier denotes an imported package and the selected member
+// exists there without denoting a type, else "" (unresolvable names keep
+// the lenient inference path: they may be type parameters resolved at
+// instantiation, and undefined names are reported downstream). Lookup
+// mirrors the selectorExpr case of isType, including the suffixed
+// package form used for dot-import collisions.
+func qualifiedNonType(n *node, sc *scope) string {
+	if n.kind != selectorExpr || len(n.child) != 2 {
+		return ""
+	}
+	pkg, name := n.child[0].ident, n.child[1].ident
+	if name == "" {
+		return ""
+	}
+	baseName := path.Base(n.interp.fset.Position(n.pos).Filename)
+	suffixedPkg := path.Join(pkg, baseName)
+	sym, _, ok := sc.lookup(suffixedPkg)
+	if !ok {
+		sym, _, ok = sc.lookup(pkg)
+		if !ok {
+			return ""
+		}
+	}
+	if sym.kind != pkgSym {
+		return ""
+	}
+	path := sym.typ.path
+	if p, ok := n.interp.binPkg[path]; ok {
+		if v, found := p[name]; found && !isBinType(v) {
+			return pkg + "." + name
+		}
+	}
+	if p, ok := n.interp.srcPkg[path]; ok {
+		if s := p[name]; s != nil && s.kind != typeSym {
+			return pkg + "." + name
+		}
+	}
+	return ""
+}
+
 // isType returns true if node refers to a type definition, false otherwise.
 func (n *node) isType(sc *scope) bool {
 	switch n.kind {
@@ -3372,7 +3419,11 @@ func digPromoted(src reflect.Value, recv reflect.Type, outer *itype) (reflect.Va
 	}
 	seen := map[reflect.Type]bool{}
 	queue := []candidate{{src, outer}}
-	for len(queue) > 0 && len(seen) < 64 {
+	// No visit-count cap: each reflect type is expanded once (seen), so
+	// the walk terminates on cyclic graphs, while deep linear chains
+	// bind at any depth, as in gc (a fixed cap truncated the search and
+	// fell through to a host-panicking historical bind; native R3-CAP64).
+	for len(queue) > 0 {
 		c := queue[0]
 		queue = queue[1:]
 		v := c.v

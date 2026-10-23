@@ -1993,9 +1993,17 @@ func getMethodByName(n *node) {
 	n.exec = func(f *frame) bltn {
 		// The interface object must be directly accessible, or embedded in a struct (exported anonymous field).
 		val0 := value0(f)
-		val, ok := value0(f).Interface().(valueInterface)
-		if !ok {
-			// Search the first embedded valueInterface.
+		var candidates []valueInterface
+		if val, ok := value0(f).Interface().(valueInterface); ok {
+			candidates = []valueInterface{val}
+		} else {
+			// Collect every embedded valueInterface candidate. The
+			// first match is not necessarily the one which carries
+			// the method (e.g. a holder embedding two interfaces
+			// where the call targets the second), so MethodByName
+			// is attempted on all candidates, in field order, until
+			// one matches. Field order keeps single-interface and
+			// first-interface dispatch identical to before.
 			for val0.Kind() == reflect.Ptr {
 				val0 = val0.Elem()
 			}
@@ -2011,55 +2019,57 @@ func getMethodByName(n *node) {
 				if !fld.IsExported() {
 					continue
 				}
-				if val, ok = val0.Field(i).Interface().(valueInterface); ok {
-					break
-					// TODO: should we keep track of all the vals that are indeed valueInterface,
-					// so that later on we can call MethodByName on all of them until one matches?
+				if val, ok := val0.Field(i).Interface().(valueInterface); ok {
+					candidates = append(candidates, val)
 				}
 			}
-			if !ok {
+			if len(candidates) == 0 {
 				panic(n.cfgErrorf("invalid interface value %v", val0))
 			}
 		}
-		// Traverse nested interface values to get the concrete value.
-		for {
-			v, ok := val.value.Interface().(valueInterface)
-			if !ok {
-				break
+		for _, cand := range candidates {
+			val := cand
+			// Traverse nested interface values to get the concrete value.
+			for {
+				v, ok := val.value.Interface().(valueInterface)
+				if !ok {
+					break
+				}
+				val = v
 			}
-			val = v
-		}
 
-		if met := val.value.MethodByName(name); met.IsValid() {
-			getFrame(f, l).data[i] = met
-			return next
-		}
-
-		typ := val.node.typ
-		if typ.node == nil && typ.cat == valueT {
-			// It happens with a var of empty interface type, that has value of concrete type
-			// from runtime, being asserted to "user-defined" interface.
-			if _, ok := typ.rtype.MethodByName(name); !ok {
-				panic(n.cfgErrorf("method not found: %s", name))
+			if met := val.value.MethodByName(name); met.IsValid() {
+				getFrame(f, l).data[i] = met
+				return next
 			}
+
+			typ := val.node.typ
+			if typ.node == nil && typ.cat == valueT {
+				// It happens with a var of empty interface type, that has value of concrete type
+				// from runtime, being asserted to "user-defined" interface.
+				if _, ok := typ.rtype.MethodByName(name); ok {
+					return next
+				}
+				continue
+			}
+
+			// Finally search method recursively in embedded valueInterfaces.
+			r, m, li := lookupMethodValue(val, name)
+			if r.IsValid() {
+				getFrame(f, l).data[i] = r
+				return next
+			}
+			if m == nil {
+				continue
+			}
+
+			nod := *m
+			nod.val = &nod
+			nod.recv = &receiver{nil, val.value, li}
+			getFrame(f, l).data[i] = genFuncValue(&nod)(f)
 			return next
 		}
-
-		// Finally search method recursively in embedded valueInterfaces.
-		r, m, li := lookupMethodValue(val, name)
-		if r.IsValid() {
-			getFrame(f, l).data[i] = r
-			return next
-		}
-		if m == nil {
-			panic(n.cfgErrorf("method not found: %s", name))
-		}
-
-		nod := *m
-		nod.val = &nod
-		nod.recv = &receiver{nil, val.value, li}
-		getFrame(f, l).data[i] = genFuncValue(&nod)(f)
-		return next
+		panic(n.cfgErrorf("method not found: %s", name))
 	}
 }
 

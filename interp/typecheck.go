@@ -1153,6 +1153,13 @@ func isMethodOperandAddressable(o *node) bool {
 			case reflect.Array:
 				o = o.child[0]
 				continue
+			case reflect.Ptr:
+				// Indexing a pointer to array auto-dereferences, as
+				// (*p)[i], which is always addressable, as in gc.
+				if base.TypeOf().Elem().Kind() == reflect.Array {
+					return true
+				}
+				return false
 			default:
 				return false
 			}

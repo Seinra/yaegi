@@ -30,6 +30,8 @@ func main() {
 	}
 	fmt.Println(slices.Sorted(seq))
 	fmt.Println(slices.Sorted(maps.Keys(map[string]int{})))
+	fmt.Println(slices.Collect(seq))
+	fmt.Println(slices.AppendSeq([]int{0}, seq))
 }
 
 // Output:
@@ -38,3 +40,5 @@ func main() {
 // [a b c]
 // [1 2 3]
 // []
+// [3 1 2]
+// [0 3 1 2]
