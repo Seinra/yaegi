@@ -1,6 +1,7 @@
 package interp
 
 import (
+	"errors"
 	"path"
 	"strings"
 )
@@ -195,6 +196,12 @@ func (interp *Interpreter) gta(root *node, rpath, importPath, pkgName string) ([
 				if rcvrtype.cat == genericT {
 					// generate methods for already instantiated receivers
 					for _, it := range rcvrtype.instance {
+						if it.incomplete {
+							// Dependencies not ready; defer compilation to a revisit.
+							pendMethod(it, pendingMethod{node: n, scope: sc, types: it.node.anc.param})
+							revisit = append(revisit, n)
+							continue
+						}
 						if err = genMethod(interp, sc, it, n, it.node.anc.param); err != nil {
 							return false
 						}
@@ -426,6 +433,11 @@ func (interp *Interpreter) gtaRetry(nodes []*node, importPath, pkgName string) e
 		n := revisit[0]
 		switch n.kind {
 		case typeSpec, typeSpecAssign:
+			if n.typ == nil {
+				// Adequate nodeType failures leave no type; report a clean
+				// error instead of panicking in definedType.
+				return n.cfgErrorf("type definition incomplete")
+			}
 			if err := definedType(n.typ); err != nil {
 				return err
 			}
@@ -440,34 +452,52 @@ func (interp *Interpreter) gtaRetry(nodes []*node, importPath, pkgName string) e
 }
 
 func definedType(typ *itype) error {
+	return definedTypeSeen(typ, map[*itype]bool{})
+}
+
+var errNilType = errors.New("interp: nil type in constant definition loop")
+
+// definedTypeSeen reports whether typ is fully defined, treating cyclic
+// references as defined (cf. seenNode handling in nodeType2). Unlike
+// isComplete it cannot loop forever on recursive types. A nil type is
+// reported as an error instead of panicking.
+func definedTypeSeen(typ *itype, seen map[*itype]bool) error {
+	if typ == nil {
+		return errNilType
+	}
+	if seen[typ] {
+		return nil
+	}
 	if !typ.incomplete {
 		return nil
 	}
+	seen[typ] = true
+	defer delete(seen, typ)
 	switch typ.cat {
 	case interfaceT, structT:
 		for _, f := range typ.field {
-			if err := definedType(f.typ); err != nil {
+			if err := definedTypeSeen(f.typ, seen); err != nil {
 				return err
 			}
 		}
 	case funcT:
 		for _, t := range typ.arg {
-			if err := definedType(t); err != nil {
+			if err := definedTypeSeen(t, seen); err != nil {
 				return err
 			}
 		}
 		for _, t := range typ.ret {
-			if err := definedType(t); err != nil {
+			if err := definedTypeSeen(t, seen); err != nil {
 				return err
 			}
 		}
 	case mapT:
-		if err := definedType(typ.key); err != nil {
+		if err := definedTypeSeen(typ.key, seen); err != nil {
 			return err
 		}
 		fallthrough
 	case linkedT, arrayT, chanT, chanSendT, chanRecvT, ptrT, variadicT:
-		if err := definedType(typ.val); err != nil {
+		if err := definedTypeSeen(typ.val, seen); err != nil {
 			return err
 		}
 	case nilT:

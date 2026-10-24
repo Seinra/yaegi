@@ -5,6 +5,7 @@ import (
 	"go/constant"
 	"log"
 	"math"
+	"os"
 	"path"
 	"reflect"
 	"strings"
@@ -50,6 +51,32 @@ func init() {
 	constBltn[bltnAlignof] = alignof
 	constBltn[bltnOffsetof] = offsetof
 	constBltn[bltnSizeof] = sizeof
+}
+
+// hasLinknameDirective reports whether the function declaration at n carries
+// a //go:linkname directive in its immediately preceding comment group.
+// Such declarations have no Go body (assembly or linknamed implementations);
+// they are skipped so importing succeeds, and calling them fails cleanly.
+func hasLinknameDirective(interp *Interpreter, n *node) bool {
+	pos := interp.fset.Position(n.pos)
+	if !pos.IsValid() {
+		return false
+	}
+	src, err := os.ReadFile(pos.Filename)
+	if err != nil {
+		return false
+	}
+	lines := strings.Split(string(src), "\n")
+	for i := pos.Line - 2; i >= 0 && i < len(lines); i-- {
+		line := strings.TrimSpace(lines[i])
+		if !strings.HasPrefix(line, "//") {
+			break
+		}
+		if strings.HasPrefix(strings.TrimSpace(strings.TrimPrefix(line, "//")), "go:linkname") {
+			return true
+		}
+	}
+	return false
 }
 
 // cfg generates a control flow graph (CFG) from AST (wiring successors in AST)
@@ -330,6 +357,31 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 
 		case caseClause:
 			sc = sc.pushBloc()
+			// Pre-define labels in case clauses too (as done for blocks
+			// below), as labeled statements can appear directly in a case
+			// body without an enclosing block. Case bodies are wrapped in
+			// a caseBody node, so scan one level deeper as well.
+			for _, c := range n.child {
+				if c.kind == caseBody {
+					for _, b := range c.child {
+						if b.kind != labeledStmt {
+							continue
+						}
+						label := b.child[0].ident
+						sym := &symbol{kind: labelSym, typ: nil, node: b, index: -1}
+						sc.sym[label] = sym
+						b.sym = sym
+					}
+					continue
+				}
+				if c.kind != labeledStmt {
+					continue
+				}
+				label := c.child[0].ident
+				sym := &symbol{kind: labelSym, typ: nil, node: c, index: -1}
+				sc.sym[label] = sym
+				c.sym = sym
+			}
 			if sn := n.anc.anc; sn.kind == typeSwitch && sn.child[1].action == aAssign {
 				// Type switch clause with a var defined in switch guard.
 				var typ *itype
@@ -359,9 +411,51 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 
 		case commClauseDefault:
 			sc = sc.pushBloc()
+			for _, c := range n.child {
+				if c.kind == caseBody {
+					for _, b := range c.child {
+						if b.kind != labeledStmt {
+							continue
+						}
+						label := b.child[0].ident
+						sym := &symbol{kind: labelSym, typ: nil, node: b, index: -1}
+						sc.sym[label] = sym
+						b.sym = sym
+					}
+					continue
+				}
+				if c.kind != labeledStmt {
+					continue
+				}
+				label := c.child[0].ident
+				sym := &symbol{kind: labelSym, typ: nil, node: c, index: -1}
+				sc.sym[label] = sym
+				c.sym = sym
+			}
 
 		case commClause:
 			sc = sc.pushBloc()
+			for _, c := range n.child {
+				if c.kind == caseBody {
+					for _, b := range c.child {
+						if b.kind != labeledStmt {
+							continue
+						}
+						label := b.child[0].ident
+						sym := &symbol{kind: labelSym, typ: nil, node: b, index: -1}
+						sc.sym[label] = sym
+						b.sym = sym
+					}
+					continue
+				}
+				if c.kind != labeledStmt {
+					continue
+				}
+				label := c.child[0].ident
+				sym := &symbol{kind: labelSym, typ: nil, node: c, index: -1}
+				sc.sym[label] = sym
+				c.sym = sym
+			}
 			if len(n.child) > 0 && n.child[0].action == aAssign {
 				ch := n.child[0].child[1].child[0]
 				var typ *itype
@@ -385,6 +479,14 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 				// Get type from 1st child.
 				if n.typ, err = nodeType(interp, sc, n.child[0]); err != nil {
 					return false
+				}
+				if n.typ != nil && n.typ.incomplete {
+					// A recursive generic instantiation cannot converge in a
+					// single nodeType pass, and structType-direct instances
+					// never pend methods themselves, so field-instance pending
+					// has no trigger. Deep-refresh cycle-aware: completes
+					// whatever is ready and compiles pending innermost-first.
+					ensureCompiled(interp, n.typ, map[*itype]bool{})
 				}
 				// Indicate that the first child is the type.
 				n.nleft = 1
@@ -445,6 +547,13 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 						if err != nil {
 							return false
 						}
+						if n.typ != nil && n.typ.incomplete {
+							// Defer compilation until dependencies complete;
+							// compiling now would frame against an incomplete
+							// type. Retried below once the type settles.
+							pendMethod(n.typ, pendingMethod{scope: nod.scope, node: nod, types: lt})
+							continue
+						}
 						if _, err = interp.cfg(gm, sc, sc.pkgID, sc.pkgName); err != nil {
 							return false
 						}
@@ -452,6 +561,9 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 							return false
 						}
 						n.typ.addMethod(gm)
+					}
+					if n.typ != nil && n.typ.incomplete {
+						ensureCompiled(interp, n.typ, map[*itype]bool{})
 					}
 					n.nleft = 1 // Indictate the type of composite literal.
 				}
@@ -498,9 +610,16 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 			fallthrough
 
 		case funcDecl:
-			// Do not allow function declarations without body.
+			// Do not allow function declarations without body, except
+			// //go:linkname declarations (assembly or linknamed symbols
+			// implemented elsewhere): skip code generation so importing
+			// succeeds; calling them fails cleanly at the use site.
 			if len(n.child) < 4 {
-				err = n.cfgErrorf("missing function body")
+				if !hasLinknameDirective(interp, n) {
+					err = n.cfgErrorf("missing function body")
+					return false
+				}
+				n.gen = nop
 				return false
 			}
 			n.val = n
@@ -1326,6 +1445,14 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 				if op, ok := constBltn[bname]; ok {
 					op(n)
 				}
+				// Operand of a const-evaluated unsafe builtin is never evaluated
+				// (gc parity): nop the whole operand subtree. Dense literals
+				// additionally skip frame registration (compositeLitExpr case).
+				if bname == bltnSizeof || bname == "unsafe.Alignof" || bname == "unsafe.Offsetof" {
+					for _, a := range n.child[1:] {
+						a.Walk(func(x *node) bool { x.gen = nop; return true }, nil)
+					}
+				}
 
 			case c0.isType(sc):
 				// Type conversion expression
@@ -1502,6 +1629,19 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 			n.lastChild().tnext = n.anc.anc // exit node is selectStmt
 
 		case compositeLitExpr:
+			// Operand of a const-evaluated unsafe builtin (Sizeof, Alignof,
+			// Offsetof) is never evaluated (gc parity): skip code generation
+			// AND frame registration, as run() materializes every scope type
+			// via reflect.New (fatal for dense array types).
+			if p := n.anc; p != nil && p.kind == callExpr && len(p.child) > 0 {
+				if f := p.child[0]; f.kind == selectorExpr && len(f.child) > 1 && f.child[0].ident == "unsafe" {
+					if id := f.child[1].ident; id == "Sizeof" || id == "Alignof" || id == "Offsetof" {
+						n.gen = nop
+						n.findex = notInFrame
+						break
+					}
+				}
+			}
 			wireChild(n)
 
 			child := n.child
@@ -1977,12 +2117,12 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 				if ti := n.typ.lookupField(n.child[1].ident); len(ti) > 0 {
 					if isStruct(n.typ) {
 						// If a method of the same name exists, use it if it is shallower than the struct field.
-						// if method's depth is the same as field's, this is an error.
+						// if method's depth is the same as field's depth (len(ti)-1), this is an error.
 						d := n.typ.methodDepth(n.child[1].ident)
-						if d >= 0 && d < len(ti) {
+						if d >= 0 && d < len(ti)-1 {
 							goto tryMethods
 						}
-						if d == len(ti) {
+						if d == len(ti)-1 {
 							err = n.cfgErrorf("ambiguous selector: %s", n.child[1].ident)
 							break
 						}
@@ -2016,12 +2156,12 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 					lind = append(lind, s.Index...)
 					if isStruct(n.typ) {
 						// If a method of the same name exists, use it if it is shallower than the struct field.
-						// if method's depth is the same as field's, this is an error.
+						// if method's depth is the same as field's depth (len(lind)-1), this is an error.
 						d := n.typ.methodDepth(n.child[1].ident)
-						if d >= 0 && d < len(lind) {
+						if d >= 0 && d < len(lind)-1 {
 							goto tryMethods
 						}
-						if d == len(lind) {
+						if d == len(lind)-1 {
 							err = n.cfgErrorf("ambiguous selector: %s", n.child[1].ident)
 							break
 						}
@@ -2108,6 +2248,15 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 			case n.child[0].isType(sc):
 				// pointer type expression
 				n.gen = nop
+				if n.child[0].typ == nil {
+					if n.child[0].typ, err = nodeType(interp, sc, n.child[0]); err != nil {
+						break
+					}
+					if n.child[0].typ == nil {
+						err = n.cfgErrorf("unresolved generic type %s", n.child[0].ident)
+						break
+					}
+				}
 				n.typ = ptrOf(n.child[0].typ)
 			default:
 				// dereference expression
@@ -2603,25 +2752,79 @@ func genGlobalVarDecl(nodes []*node, sc *scope) (*node, error) {
 	return varNode, nil
 }
 
-func getVarDependencies(nod *node, sc *scope) (deps []*node) {
-	nod.Walk(func(n *node) bool {
-		if n.kind != identExpr {
-			return true
+func getVarDependencies(varNode *node, _ *scope) (deps []*node) {
+	seenDep := map[*node]bool{}
+	addDep := func(target *node) {
+		if target == nil || target == varNode || seenDep[target] {
+			return
 		}
-		// Process ident nodes, and avoid false dependencies.
-		if n.anc.kind == selectorExpr && childPos(n) == 1 {
+		seenDep[target] = true
+		deps = append(deps, target)
+	}
+
+	visitedFunc := map[*node]bool{}
+	queue := []*node{varNode}
+
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+		if visitedFunc[current] {
+			continue
+		}
+		// Only func bodies are marked visited; the initial varNode may
+		// reappear as a dependency target but must still be walked once.
+		if current != varNode {
+			visitedFunc[current] = true
+		}
+
+		var pendingFunc []*node
+		current.Walk(func(candidate *node) bool {
+			// Skip nested function definitions unless they are
+			// immediately invoked; their bodies do not run at init.
+			if candidate != current && (candidate.kind == funcLit || candidate.kind == funcDecl) {
+				if candidate.anc != nil && candidate.anc.kind == callExpr && childPos(candidate) == 0 {
+					pendingFunc = append(pendingFunc, candidate)
+				}
+				return false
+			}
+			if candidate.kind != identExpr {
+				return true
+			}
+			// Avoid false dependencies on selector field names.
+			if candidate.anc != nil && candidate.anc.kind == selectorExpr && childPos(candidate) == 1 {
+				return false
+			}
+			lookupSym := candidate.sym
+			if lookupSym == nil {
+				// Definition site (param, func name, local define) or
+				// unresolved: not a use, so no dependency edge. Skipping
+				// avoids mistaking a param name for a same-named global.
+				return false
+			}
+			sym := lookupSym // A call to a package-level function pulls the transitive
+			// globals its body touches (gc init-order: X = f() depends
+			// on what f reads, recursively). A mere reference to the
+			// function value does not execute it, so it adds no edge.
+			isCallee := candidate.anc != nil && candidate.anc.kind == callExpr && childPos(candidate) == 0
+			if sym.kind == funcSym && sym.node != nil {
+				if isCallee && !visitedFunc[sym.node] {
+					pendingFunc = append(pendingFunc, sym.node)
+				}
+				return false
+			}
+			if sym.kind != varSym || !sym.global || sym.node == varNode {
+				return false
+			}
+			addDep(sym.node)
 			return false
+		}, nil)
+
+		for _, fn := range pendingFunc {
+			if !visitedFunc[fn] {
+				queue = append(queue, fn)
+			}
 		}
-		sym, _, ok := sc.lookup(n.ident)
-		if !ok {
-			return false
-		}
-		if sym.kind != varSym || !sym.global || sym.node == nod {
-			return false
-		}
-		deps = append(deps, sym.node)
-		return false
-	}, nil)
+	}
 	return deps
 }
 
@@ -2745,6 +2948,10 @@ func (n *node) isType(sc *scope) bool {
 		return n.typ.scope.pkgID != sc.pkgID
 	case indexExpr:
 		// Maybe a generic type.
+		sym, _, ok := sc.lookup(n.child[0].ident)
+		return ok && sym.kind == typeSym
+	case indexListExpr:
+		// Maybe a generic type with multiple parameters.
 		sym, _, ok := sc.lookup(n.child[0].ident)
 		return ok && sym.kind == typeSym
 	}

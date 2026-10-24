@@ -105,10 +105,19 @@ func (check typecheck) addressExpr(n *node) error {
 			continue
 		case indexExpr, sliceExpr:
 			c := c0.child[0]
-			if isArray(c.typ) || isMap(c.typ) {
+			if c.typ != nil && (isArray(c.typ) || isMap(c.typ)) {
 				c0 = c
 				found = true
 				continue
+			}
+			if c.typ != nil && isPtr(c.typ) {
+				// Indexing a pointer to array auto-dereferences as (*p)[i],
+				// whose elements are always addressable (as in gc).
+				if et := c.typ.val; et != nil && isArray(et) {
+					c0 = c
+					found = true
+					continue
+				}
 			}
 		case compositeLitExpr, identExpr:
 			found = true
