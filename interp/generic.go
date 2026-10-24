@@ -23,7 +23,7 @@ func genAST(sc *scope, root *node, types []*itype) (*node, bool, error) {
 	rtname := ""
 	recvrPtr := false
 	fixNodes := []*node{}
-	var gtree func(*node, *node) (*node, error)
+	var gtree func(n, anc *node, inBody bool) (*node, error)
 	sname := root.child[0].ident + "["
 	if root.kind == funcDecl {
 		sname = root.child[1].ident + "["
@@ -36,7 +36,7 @@ func genAST(sc *scope, root *node, types []*itype) (*node, bool, error) {
 	}
 	sname = strings.TrimSuffix(sname, ",") + "]"
 
-	gtree = func(n, anc *node) (*node, error) {
+	gtree = func(n, anc *node, inBody bool) (*node, error) {
 		nod := copyNode(n, anc, false)
 		switch n.kind {
 		case funcDecl, funcType:
@@ -46,6 +46,21 @@ func genAST(sc *scope, root *node, types []*itype) (*node, bool, error) {
 			// Replace generic type by instantiated one.
 			nt, ok := typeParam[n.ident]
 			if !ok {
+				// The clone may refer to names which are visible at the
+				// definition site but not at the instantiation site (types
+				// and packages of the generic package). Resolve them in the
+				// definition scope, so nested instantiations complete instead
+				// of degrading to incomplete types, except in function bodies
+				// which compile in the definition scope already. Names visible
+				// at the instantiation site keep their normal resolution, as
+				// well as declaration names which are never resolved.
+				if !inBody && !isGenericName(root, n) {
+					if _, _, found := sc.lookup(n.ident); !found {
+						if typ := lookupDefinitionType(root, n.ident); typ != nil {
+							nod.typ = typ
+						}
+					}
+				}
 				break
 			}
 			nod = copyNode(nt, anc, true)
@@ -147,7 +162,7 @@ func genAST(sc *scope, root *node, types []*itype) (*node, bool, error) {
 		}
 
 		for _, c := range n.child {
-			gn, err := gtree(c, nod)
+			gn, err := gtree(c, nod, inBody || c.kind == blockStmt)
 			if err != nil {
 				return nil, err
 			}
@@ -160,7 +175,7 @@ func genAST(sc *scope, root *node, types []*itype) (*node, bool, error) {
 		return nod, true, nil
 	}
 
-	r, err := gtree(root, root.anc)
+	r, err := gtree(root, root.anc, false)
 	if err != nil {
 		return nil, false, err
 	}
@@ -184,6 +199,43 @@ func genAST(sc *scope, root *node, types []*itype) (*node, bool, error) {
 	}
 	// r.adot() // Used for debugging only.
 	return r, false, nil
+}
+
+// isGenericName reports whether n is the declared name of a generic type or
+// function being cloned, which is never resolved and must keep no stamped type.
+func isGenericName(root, n *node) bool {
+	if n.kind != identExpr {
+		return false
+	}
+	switch root.kind {
+	case typeSpec:
+		return len(root.child) > 0 && n == root.child[0]
+	case funcDecl:
+		index := 0
+		if len(root.child) > 0 && root.child[0].kind == fieldList {
+			index = 1
+		}
+		return len(root.child) > index && n == root.child[index]
+	}
+	return false
+}
+
+// lookupDefinitionType resolves a bare identifier in the scope where a generic
+// definition was declared, for nodes cloned by genAST. It returns the declared
+// type for visible type and package symbols with complete types, or nil when the
+// name is not visible there, so callers keep the normal resolution path.
+func lookupDefinitionType(root *node, ident string) *itype {
+	if root == nil || root.scope == nil {
+		return nil
+	}
+	if sym, _, found := root.scope.lookup(ident); found && sym.typ != nil && !sym.typ.incomplete &&
+		(sym.kind == typeSym || sym.kind == pkgSym) {
+		return sym.typ
+	}
+	if sym, ok := lookupPackageByBase(root.scope, ident); ok && sym.typ != nil && !sym.typ.incomplete {
+		return sym.typ
+	}
+	return nil
 }
 
 func copyNode(n, anc *node, recursive bool) *node {

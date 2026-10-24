@@ -1056,7 +1056,14 @@ func nodeType2(interp *Interpreter, sc *scope, n *node, seen []*node) (t *itype,
 			switch {
 			case len(c.child) == 1:
 				typ, err := nodeType2(interp, sc, c.child[0], seen)
+				if typ == nil && err == nil {
+					err = c.cfgErrorf("incomplete embedded field type %s", fieldName(c.child[0]))
+				}
 				if err != nil {
+					if t != nil {
+						t.incomplete = true
+						t.path = sc.pkgName
+					}
 					return nil, err
 				}
 				fields = append(fields, structField{name: fieldName(c.child[0]), embed: true, typ: typ})
@@ -1064,7 +1071,14 @@ func nodeType2(interp *Interpreter, sc *scope, n *node, seen []*node) (t *itype,
 			case len(c.child) == 2 && c.child[1].kind == basicLit:
 				tag := vString(c.child[1].rval)
 				typ, err := nodeType2(interp, sc, c.child[0], seen)
+				if typ == nil && err == nil {
+					err = c.cfgErrorf("incomplete embedded field type %s", fieldName(c.child[0]))
+				}
 				if err != nil {
+					if t != nil {
+						t.incomplete = true
+						t.path = sc.pkgName
+					}
 					return nil, err
 				}
 				fields = append(fields, structField{name: fieldName(c.child[0]), embed: true, typ: typ, tag: tag})
@@ -1077,7 +1091,14 @@ func nodeType2(interp *Interpreter, sc *scope, n *node, seen []*node) (t *itype,
 					l--
 				}
 				typ, err := nodeType2(interp, sc, c.child[l-1], seen)
+				if typ == nil && err == nil {
+					err = c.cfgErrorf("incomplete struct field type")
+				}
 				if err != nil {
+					if t != nil {
+						t.incomplete = true
+						t.path = sc.pkgName
+					}
 					return nil, err
 				}
 				incomplete = incomplete || typ.incomplete
@@ -1189,9 +1210,42 @@ func findPackageType(interp *Interpreter, sc *scope, n *node) *itype {
 	baseName := path.Base(interp.fset.Position(n.pos).Filename)
 	sym, _, found := sc.lookup(path.Join(n.ident, baseName))
 	if !found || sym.typ == nil && sym.typ.cat != srcPkgT && sym.typ.cat != binPkgT {
+		// The node may have been cloned from another file (e.g. generic
+		// type instantiation), so its file basename does not match the
+		// suffix of the importing file package symbol. Fall back to a
+		// package symbol with the same name when it is unambiguous.
+		if fallback, ok := lookupPackageByBase(sc, n.ident); ok {
+			return fallback.typ
+		}
 		return nil
 	}
 	return sym.typ
+}
+
+// lookupPackageByBase returns the package symbol imported under the given
+// name when exactly one file suffixed entry exists in scope. It returns
+// false when there is no entry or the name is ambiguous.
+func lookupPackageByBase(sc *scope, name string) (*symbol, bool) {
+	prefix := name + "/"
+	var match *symbol
+	for cursor := sc; cursor != nil; cursor = cursor.anc {
+		for key, sym := range cursor.sym {
+			if !strings.HasPrefix(key, prefix) || sym.kind != pkgSym {
+				continue
+			}
+			if sym.typ == nil || (sym.typ.cat != srcPkgT && sym.typ.cat != binPkgT) {
+				continue
+			}
+			if match != nil {
+				return nil, false
+			}
+			match = sym
+		}
+	}
+	if match == nil {
+		return nil, false
+	}
+	return match, true
 }
 
 func isBuiltinCall(n *node, sc *scope) bool {
