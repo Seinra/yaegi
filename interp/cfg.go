@@ -2272,7 +2272,19 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 				} else {
 					n.typ = c0.typ.val
 				}
-				n.findex = sc.add(n.typ)
+				if n.typ.cat == arrayT && isSliceDerefOperand(n) {
+					// Slicing a dereferenced array pointer, e.g.
+					// (*(*RawMem)(unsafe.Pointer(s)))[:n:n], needs no array-typed
+					// frame slot: the sliceExpr case bypasses this deref node and slices
+					// the pointer directly (genValueArray dereferences pointer operands
+					// itself). Registering the slot would allocate the whole array at
+					// function entry via reflect.New, fatal for huge arrays
+					// (modernc.org/libc RawMem is 2^50-1 bytes, OOMing the host).
+					n.findex = notInFrame
+					n.gen = nop
+				} else {
+					n.findex = sc.add(n.typ)
+				}
 			}
 
 		case typeSwitch:
@@ -2422,6 +2434,26 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 			}
 
 		case sliceExpr:
+			// Slicing the dereference of an array pointer, e.g.
+			// (*(*RawMem)(unsafe.Pointer(s)))[:n:n], registers a frame slot for the
+			// whole array type (starExpr does sc.add(arrayT)), which is fatal for huge
+			// arrays: modernc.org/libc RawMem is 2^50-1 bytes, OOMing the host at
+			// function entry via reflect.New. Slicing a pointer to array is defined
+			// as slicing its dereference, and genValueArray already dereferences
+			// pointer operands, so use the pointer directly and drop the redundant
+			// deref node (looking through parenExpr wrappers, which yaegi keeps as
+			// nodes). Provably identical, including the nil-pointer panic.
+			if len(n.child) > 0 {
+				op := n.child[0]
+				for op.kind == parenExpr && len(op.child) == 1 {
+					op = op.child[0]
+				}
+				if op.kind == starExpr && op.typ != nil && op.typ.cat == arrayT &&
+					len(op.child) == 1 && op.child[0].typ != nil && op.child[0].typ.cat == ptrT {
+					op.child[0].anc = n
+					n.child[0] = op.child[0]
+				}
+			}
 			wireChild(n)
 
 			err = check.sliceExpr(n)
@@ -2637,6 +2669,18 @@ func compDefineX(sc *scope, n *node) error {
 //	}
 //	return false
 // }
+
+// isSliceDerefOperand reports whether n is the operand of a slice expression,
+// looking through parenExpr wrappers. The sliceExpr case bypasses such a deref
+// node (genValueArray dereferences pointer operands itself), so the deref
+// needs no frame slot of its own.
+func isSliceDerefOperand(n *node) bool {
+	top := n
+	for top.anc != nil && top.anc.kind == parenExpr {
+		top = top.anc
+	}
+	return top.anc != nil && top.anc.kind == sliceExpr && len(top.anc.child) > 0 && top.anc.child[0] == top
+}
 
 func childPos(n *node) int {
 	for i, c := range n.anc.child {
