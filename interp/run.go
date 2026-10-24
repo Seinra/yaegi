@@ -53,6 +53,7 @@ var builtin = [...]bltnGenerator{
 	aQuo:          quo,
 	aQuoAssign:    quoAssign,
 	aRange:        _range,
+	aRangeAssign:  _range,
 	aRecv:         recv,
 	aRem:          rem,
 	aRemAssign:    remAssign,
@@ -323,6 +324,45 @@ func typeAssert(n *node, withResult, withOk bool) {
 				defer func() {
 					value1(f).SetBool(ok)
 				}()
+			}
+			if !ok {
+				// The asserted value may be a binary (non-interpreted)
+				// concrete value, e.g. a *sync.Pool returned from a binary
+				// call, asserted to an interpreted interface. Verify its
+				// method set and wrap it, so the rest of the flow applies
+				// unchanged. Without this, valid programs panic with a
+				// misleading "nil is not X" error.
+				if c0.typ.cat == valueT {
+					if bv := valf; bv.IsValid() {
+						if bv.Kind() == reflect.Interface {
+							if bv.IsNil() {
+								bv = reflect.Value{}
+							} else {
+								bv = bv.Elem()
+							}
+						}
+						if bv.IsValid() {
+							m1 := typ.methods()
+							matched := true
+							for k, meth1 := range m1 {
+								bm, ok := bv.Type().MethodByName(k)
+								if !ok {
+									matched = false
+									break
+								}
+								meth0, err := stripReceiverFromArgs(bm.Type.String())
+								if err != nil || meth0 != meth1 {
+									matched = false
+									break
+								}
+							}
+							if matched {
+								v = valueInterface{node: c1, value: bv}
+								ok = true
+							}
+						}
+					}
+				}
 			}
 			if !ok {
 				if !withOk {
@@ -666,6 +706,39 @@ func assignFromCall(n *node) {
 		}
 		dvalue[i] = genValue(n.child[i])
 	}
+	// wrap converts the ith call result to the destination type when the
+	// destination is a non-empty binary interface and the result is an
+	// interpreted concrete value (e.g. r, err = newRows(...) into
+	// r driver.Rows). Without the wrapper, reflect rejects the method-less
+	// interpreted value when stored in the binary-typed destination slot,
+	// as for other interface-boundary shapes. Nil when no conversion is
+	// needed (raw path preserved, e.g. error results keep identity).
+	wrap := make([]func(*frame) reflect.Value, l)
+	for i := range wrap {
+		c := n.child[i]
+		if c.ident == "_" {
+			continue
+		}
+		destType := c.typ
+		var srcType *itype
+		if ft := ncall.child[0].typ; ft != nil && i < len(ft.ret) {
+			srcType = ft.ret[i]
+		}
+		if srcType == nil || !isInterfaceBin(destType) || destType.rtype.NumMethod() == 0 || destType.cat == errorT {
+			continue
+		}
+		if srcType.cat == valueT || srcType.cat == errorT || srcType.cat == nilT {
+			continue
+		}
+		// Proxy the call node: read this result's temp slot with the
+		// concrete result type, so the wrapper is built from the same
+		// method set as other interface-boundary shapes. The copy keeps
+		// the original call node untouched.
+		proxy := *ncall
+		proxy.findex = ncall.findex + i
+		proxy.typ = srcType
+		wrap[i] = genInterfaceWrapper(&proxy, destType.rtype)
+	}
 	next := getExec(n.tnext)
 	n.exec = func(f *frame) bltn {
 		for i, v := range dvalue {
@@ -674,6 +747,9 @@ func assignFromCall(n *node) {
 			}
 			s := f.data[ncall.findex+i]
 			c := n.child[i]
+			if w := wrap[i]; w != nil {
+				s = w(f)
+			}
 			if n.kind == defineXStmt && !c.redeclared {
 				// Recreate destination value in case of define statement,
 				// to preserve previous value possibly in use by a closure.
@@ -1245,6 +1321,14 @@ func call(n *node) {
 					continue
 				}
 				values = append(values, func(f *frame) reflect.Value {
+					if v := f.data[ind]; v.IsValid() {
+						if vi, ok := v.Interface().(valueInterface); ok && vi.node != nil && vi.node.typ != nil {
+							// The return site already wrapped the value with the
+							// concrete type node; preserve it, as the callee
+							// signature node below carries no usable type.
+							return v
+						}
+					}
 					return reflect.ValueOf(valueInterface{node: cc0.typ.ret[j].node, value: f.data[ind]})
 				})
 			}
@@ -1514,6 +1598,28 @@ func callBin(n *node) {
 			}
 		case isRegularCall(c):
 			// Handle nested function calls: pass returned values as arguments
+			if len(c.child[0].typ.ret) == 1 {
+				// A single result feeding a non-empty binary interface parameter
+				// (e.g. sql.Register(name, newDriver())) must go through the
+				// interface wrapper, as for other argument shapes below, else
+				// reflect rejects the interpreted value which carries no binary
+				// methods. Other shapes keep the historical raw path.
+				var defType reflect.Type
+				if variadic >= 0 && i+rcvrOffset >= variadic {
+					defType = funcType.In(variadic)
+				} else {
+					defType = funcType.In(rcvrOffset + i)
+				}
+				if getMapType != nil {
+					if rt := getMapType(c.typ); rt != nil {
+						defType = rt
+					}
+				}
+				if defType != nil && defType.Kind() == reflect.Interface && defType.NumMethod() > 0 && c.typ.cat != valueT {
+					values = append(values, genInterfaceWrapper(c, defType))
+					break
+				}
+			}
 			for j := range c.child[0].typ.ret {
 				ind := c.findex + j
 				values = append(values, func(f *frame) reflect.Value { return valueInterfaceValue(f.data[ind]) })
@@ -2813,10 +2919,13 @@ func doComposite(n *node, hasType bool, keyed bool) {
 		case d.Kind() == reflect.Ptr:
 			d.Set(a.Addr())
 		case destInterface:
-			if len(destType(n).field) > 0 {
+			if len(destType(n).field) > 0 && d.Type() == valueInterfaceType {
 				d.Set(reflect.ValueOf(valueInterface{n, a}))
 				break
 			}
+			// The composite slot carries the composite struct type (e.g. the
+			// composite is the source of an assignment to an interface). Store
+			// the raw value; readers wrap it in a valueInterface as needed.
 			d.Set(a)
 		default:
 			getFrame(f, l).data[frameIndex] = a
@@ -3298,15 +3407,30 @@ func _case(n *node) {
 						return tnext
 					}
 					ival := v.Interface()
-					if ival != nil && rtyp.String() == reflect.TypeOf(ival).String() {
-						destValue(f).Set(elem)
-						return tnext
+					if ival != nil {
+						if ivi, isWrap := ival.(valueInterface); isWrap {
+							// Wrapped value: for an interface case type,
+							// match iff its method set implements the
+							// case type. For a concrete case type, fall
+							// through to the type-identity check below.
+							// Never match on the wrapper name itself.
+							if isInterface(typ) && ivi.node != nil && ivi.node.typ != nil && ivi.value.IsValid() && ivi.node.typ.methods().contains(typ.methods()) {
+								destValue(f).Set(elem)
+								return tnext
+							}
+						} else if rtyp.String() == reflect.TypeOf(ival).String() {
+							// Raw value of matching concrete type.
+							destValue(f).Set(elem)
+							return tnext
+						}
 					}
 					if typ.cat == valueT && rtyp.Kind() == reflect.Interface && elem.IsValid() && elem.Type().Implements(rtyp) {
 						destValue(f).Set(elem)
 						return tnext
 					}
-					return fnext
+					// Fall through to the valueInterface check below, so wrapped
+					// values also match by concrete type identity, not only
+					// by the interface-kind shape above.
 				}
 				if vi, ok := v.Interface().(valueInterface); ok {
 					if vi.node != nil {
@@ -3342,16 +3466,29 @@ func _case(n *node) {
 							return tnext
 						}
 						ival := val.Interface()
-						if ival != nil && rtyp.String() == reflect.TypeOf(ival).String() {
-							destValue(f).Set(elem)
-							return tnext
+						if ival != nil {
+							if ivi, isWrap := ival.(valueInterface); isWrap {
+								// Wrapped value: for an interface case type,
+								// match iff its method set implements the
+								// case type. For a concrete case type, fall
+								// through to the identity checks below.
+								// Never match on the wrapper name itself.
+								if isInterface(typ) && ivi.node != nil && ivi.node.typ != nil && ivi.value.IsValid() && ivi.node.typ.methods().contains(typ.methods()) {
+									destValue(f).Set(elem)
+									return tnext
+								}
+							} else if rtyp.String() == reflect.TypeOf(ival).String() {
+								// Raw value of matching concrete type.
+								destValue(f).Set(elem)
+								return tnext
+							}
 						}
 						if typ.cat == valueT && rtyp.Kind() == reflect.Interface && elem.IsValid() && elem.Type().Implements(rtyp) {
 							destValue(f).Set(elem)
 							return tnext
 						}
 					}
-					return fnext
+					// Fall through to the valueInterface check below.
 				}
 				if vi, ok := val.Interface().(valueInterface); ok {
 					if v := vi.node; v != nil {
