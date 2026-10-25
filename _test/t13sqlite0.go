@@ -49,6 +49,17 @@ func (d *t13driver) Open(name string) (driver.Conn, error) { return nil, nil }
 
 func newT13Driver() *t13driver { return &t13driver{} }
 
+// t13registerOnce keeps the corpus deterministic when the consistency
+// harnesses evaluate this file twice in one host process
+// (TestInterpConsistencyBuild then TestFile): the second sql.Register
+// with the same name panics in the host database/sql registry, which is
+// harness scaffolding, not pinned behavior. First evaluation registers
+// for real; later ones recover and continue with identical output.
+func t13registerOnce() {
+	defer func() { _ = recover() }()
+	sql.Register("t13sqlite0", newT13Driver())
+}
+
 // t13gopen exercises an interpreted call result flowing into an interpreted
 // interface parameter, then asserted to an anonymous interface (gorm Open
 // pattern: dialector.(interface{ Apply(*Config) error })). The return site
@@ -141,7 +152,7 @@ func main() {
 		return
 	}
 	println("t13sqlite0 addrderef ok:", addrDeref())
-	sql.Register("t13sqlite0", newT13Driver())
+	t13registerOnce()
 	println("t13sqlite0 register ok")
 	if got := t13gopen(t13open(":memory:")); got != 7 {
 		println("MISMATCH:", got)
