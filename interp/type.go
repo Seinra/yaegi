@@ -433,10 +433,34 @@ func nodeType2(interp *Interpreter, sc *scope, n *node, seen []*node) (t *itype,
 	defer func() { seen = seen[:len(seen)-1] }()
 
 	switch n.kind {
-	case addressExpr, starExpr:
+	case addressExpr:
 		val, err := nodeType2(interp, sc, n.child[0], seen)
 		if err != nil {
 			return nil, err
+		}
+		t = ptrOf(val, withNode(n), withScope(sc))
+		t.incomplete = val.incomplete
+
+	case starExpr:
+		val, err := nodeType2(interp, sc, n.child[0], seen)
+		if err != nil {
+			return nil, err
+		}
+		if !val.incomplete && !n.child[0].isType(sc) {
+			// Dereference expression (the child denotes a value, not a type):
+			// the type is the pointed element, mirroring the dereference
+			// branch of the CFG starExpr processing. A pointer type expression
+			// (*T) keeps the historical ptrOf path below, as do unresolved
+			// operands (which stay incomplete and revisit later).
+			if val.cat == valueT {
+				if val.rtype != nil && val.rtype.Kind() == reflect.Ptr {
+					t = valueTOf(val.rtype.Elem(), withNode(n), withScope(sc))
+					break
+				}
+			} else if val.cat == ptrT {
+				t = val.val
+				break
+			}
 		}
 		t = ptrOf(val, withNode(n), withScope(sc))
 		t.incomplete = val.incomplete
@@ -2476,23 +2500,19 @@ func (t *itype) refType(ctx *refTypeContext) reflect.Type {
 			for _, s := range ctx.defined {
 				for i := 0; i < s.rtype.NumField(); i++ {
 					f := s.rtype.Field(i)
-					if strings.HasSuffix(f.Type.String(), "unsafe2.dummy") {
-						// The dummy stands for the field's own declared type, which is
-						// now complete (isComplete gate above), so resolve it from the
-						// field itype. Dummies in flight may belong to different
-						// ancestors of the same recursion web, so the owner must come
-						// from the field itself: patching with any other in-flight type
-						// builds an illegal by-value cycle which overflows the host
-						// stack in reflect type construction (fatal). See odd task T8.
+					if strings.Contains(f.Type.String(), "unsafe2.dummy") {
+						// The field type embeds a dummy from an in-flight recursive
+						// type, directly or nested in a func, slice, map or pointer
+						// shape (e.g. match func(*DB) bool, fns []func(*DB)). Under
+						// the isComplete gate nothing is in flight (all rtypes are
+						// set, so the nested call below only reads cached types),
+						// which avoids the illegal by-value cycle of task T8.
 						ftyp := s.field[i].typ.refType(&refTypeContext{defined: ctx.defined, rebuilding: true})
 						unsafe2.SetFieldType(s.rtype, i, ftyp)
 						if name == s.path+"/"+s.name {
 							fieldFix = append(fieldFix, fixStructField{s.name, i})
 						}
 						continue
-					}
-					if f.Type.Kind() == reflect.Func && strings.Contains(f.Type.String(), "unsafe2.dummy") {
-						fieldFix = append(fieldFix, fixStructField{s.name, i})
 					}
 				}
 			}

@@ -349,6 +349,14 @@ func (interp *Interpreter) gta(root *node, rpath, importPath, pkgName string) ([
 				// Create an aliased type in the current scope
 				sc.sym[typeName] = &symbol{kind: typeSym, node: n, typ: typ}
 				n.typ = typ
+				if !typ.isComplete() {
+					// The aliased type refers to a type which is not fully defined yet
+					// (e.g. declared later in the package). Defer it to a later pass, as
+					// done for defined types below, so forward references resolve instead
+					// of freezing a nilT placeholder into the alias.
+					revisit = append(revisit, n)
+					return false
+				}
 				break
 			}
 

@@ -46,6 +46,26 @@ var constBltn = map[string]func(*node){
 
 const nilIdent = "nil"
 
+// defineLabelSym pre-defines the symbol of the labeled statement labelNode and of
+// all the labeled statements possibly nested in its statement (consecutive
+// labels, as generated for example by ccgo: "zulu_time:\n__10:\n..."),
+// so they are all defined when met during the CFG walk. Only direct children
+// of blocks are scanned by callers, and consecutive labels nest in the AST
+// (the inner labeled statement is the statement of the outer one), so without
+// descending the chain the inner labels stay undefined.
+func defineLabelSym(sc *scope, labelNode *node) {
+	for current := labelNode; ; {
+		label := current.child[0].ident
+		sym := &symbol{kind: labelSym, node: current, index: -1}
+		sc.sym[label] = sym
+		current.sym = sym
+		if len(current.child) < 2 || current.child[1].kind != labeledStmt {
+			break
+		}
+		current = current.child[1]
+	}
+}
+
 func init() {
 	// Use init() to avoid initialization cycles for the following constant builtins.
 	constBltn[bltnAlignof] = alignof
@@ -151,6 +171,7 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 
 		case blockStmt:
 			var rangek, rangev *node
+			var outerK, outerV *symbol
 			if n.anc != nil && n.anc.kind == rangeStmt {
 				// For range block: ensure that array or map type is propagated to iterators
 				// prior to process block. We cannot perform this at RangeStmt pre-order because
@@ -260,6 +281,24 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 						n.anc.gen = rangeFunc
 					}
 
+					// For the assign form (for k, v = range ...), capture any
+					// pre-existing variables of the same name, so the loop
+					// variables below can alias them instead of shadowing them.
+					// This makes post-loop reads observe the last iteration
+					// value, as in gc.
+					if n.anc.action == aRangeAssign {
+						if k.ident != "_" {
+							if s, _, ok := sc.lookup(k.ident); ok {
+								outerK = s
+							}
+						}
+						if v != nil && v.ident != "_" {
+							if s, _, ok := sc.lookup(v.ident); ok {
+								outerV = s
+							}
+						}
+					}
+
 					kindex := sc.add(ktyp)
 					sc.sym[k.ident] = &symbol{index: kindex, kind: varSym, typ: ktyp}
 					k.typ = ktyp
@@ -284,19 +323,34 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 				lk := n.child[0]
 				if rangek != nil {
 					lk.ident = rangek.ident
-					lk.typ = rangek.typ
-					kindex := sc.add(lk.typ)
-					sc.sym[lk.ident] = &symbol{index: kindex, kind: varSym, typ: lk.typ}
-					lk.findex = kindex
+					if outerK != nil {
+						// Assign form with a pre-existing variable: alias the
+						// outer slot instead of allocating a shadowing one, so
+						// writes (and post-loop reads) hit the outer variable.
+						lk.typ = outerK.typ
+						lk.findex = outerK.index
+						sc.sym[lk.ident] = &symbol{index: outerK.index, kind: varSym, typ: outerK.typ}
+					} else {
+						lk.typ = rangek.typ
+						kindex := sc.add(lk.typ)
+						sc.sym[lk.ident] = &symbol{index: kindex, kind: varSym, typ: lk.typ}
+						lk.findex = kindex
+					}
 					lk.gen = loopVarKey
 				}
 				lv := n.child[1]
 				if rangev != nil {
 					lv.ident = rangev.ident
-					lv.typ = rangev.typ
-					vindex := sc.add(lv.typ)
-					sc.sym[lv.ident] = &symbol{index: vindex, kind: varSym, typ: lv.typ}
-					lv.findex = vindex
+					if outerV != nil {
+						lv.typ = outerV.typ
+						lv.findex = outerV.index
+						sc.sym[lv.ident] = &symbol{index: outerV.index, kind: varSym, typ: outerV.typ}
+					} else {
+						lv.typ = rangev.typ
+						vindex := sc.add(lv.typ)
+						sc.sym[lv.ident] = &symbol{index: vindex, kind: varSym, typ: lv.typ}
+						lv.findex = vindex
+					}
 					lv.gen = loopVarVal
 				}
 			}
@@ -321,10 +375,7 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 				if c.kind != labeledStmt {
 					continue
 				}
-				label := c.child[0].ident
-				sym := &symbol{kind: labelSym, node: c, index: -1}
-				sc.sym[label] = sym
-				c.sym = sym
+				defineLabelSym(sc, c)
 			}
 			// If block is the body of a function, get declared variables in current scope.
 			// This is done in order to add the func signature symbols into sc.sym,
@@ -367,20 +418,14 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 						if b.kind != labeledStmt {
 							continue
 						}
-						label := b.child[0].ident
-						sym := &symbol{kind: labelSym, typ: nil, node: b, index: -1}
-						sc.sym[label] = sym
-						b.sym = sym
+						defineLabelSym(sc, b)
 					}
 					continue
 				}
 				if c.kind != labeledStmt {
 					continue
 				}
-				label := c.child[0].ident
-				sym := &symbol{kind: labelSym, typ: nil, node: c, index: -1}
-				sc.sym[label] = sym
-				c.sym = sym
+				defineLabelSym(sc, c)
 			}
 			if sn := n.anc.anc; sn.kind == typeSwitch && sn.child[1].action == aAssign {
 				// Type switch clause with a var defined in switch guard.
@@ -417,20 +462,14 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 						if b.kind != labeledStmt {
 							continue
 						}
-						label := b.child[0].ident
-						sym := &symbol{kind: labelSym, typ: nil, node: b, index: -1}
-						sc.sym[label] = sym
-						b.sym = sym
+						defineLabelSym(sc, b)
 					}
 					continue
 				}
 				if c.kind != labeledStmt {
 					continue
 				}
-				label := c.child[0].ident
-				sym := &symbol{kind: labelSym, typ: nil, node: c, index: -1}
-				sc.sym[label] = sym
-				c.sym = sym
+				defineLabelSym(sc, c)
 			}
 
 		case commClause:
@@ -441,20 +480,14 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 						if b.kind != labeledStmt {
 							continue
 						}
-						label := b.child[0].ident
-						sym := &symbol{kind: labelSym, typ: nil, node: b, index: -1}
-						sc.sym[label] = sym
-						b.sym = sym
+						defineLabelSym(sc, b)
 					}
 					continue
 				}
 				if c.kind != labeledStmt {
 					continue
 				}
-				label := c.child[0].ident
-				sym := &symbol{kind: labelSym, typ: nil, node: c, index: -1}
-				sc.sym[label] = sym
-				c.sym = sym
+				defineLabelSym(sc, c)
 			}
 			if len(n.child) > 0 && n.child[0].action == aAssign {
 				ch := n.child[0].child[1].child[0]
@@ -1781,6 +1814,12 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 			}
 			n.start = init.start
 			body.start = body.child[0] // loopvar
+			if len(body.child) == 1 {
+				// Empty body (only the synthetic loopvar above): skip it,
+				// else the condition wires to a no-exec node and a true
+				// condition silently ends the function with zero values.
+				body.start = post.start
+			}
 			if cond.rval.IsValid() {
 				// Condition is known at compile time, bypass test.
 				if cond.rval.Bool() {
@@ -2081,6 +2120,10 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 				if s, ok := interp.binPkg[pkg][name]; ok {
 					if isBinType(s) {
 						n.typ = valueTOf(s.Type().Elem())
+						// A type carries no runtime value; registering a frame
+						// slot for it would materialize huge types (e.g. an
+						// array) at function entry.
+						n.findex = notInFrame
 					} else {
 						n.typ = valueTOf(fixPossibleConstType(s.Type()), withUntyped(isValueUntyped(s)))
 						n.rval = s
@@ -2101,6 +2144,13 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 					n.findex = sym.index
 					if sym.global {
 						n.level = globalFrame
+					}
+					if sym.kind == typeSym {
+						// A type carries no runtime value; registering a frame
+						// slot for it would materialize huge array types
+						// (e.g. libc.RawMem, 2^50-1 bytes) at function entry
+						// via reflect.New, OOMing the host.
+						n.findex = notInFrame
 					}
 					n.val = sym.node
 					n.gen = nop
