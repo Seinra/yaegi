@@ -255,6 +255,16 @@ func genValueInterface(n *node) func(*frame) reflect.Value {
 			return v
 		}
 
+		// Snapshot addressable values into fresh storage. The wrapped value
+		// may outlive the current frame (e.g. appended to a slice in a loop),
+		// while frame temp slots are reused and overwritten in place. Without
+		// a copy, stored wrappers would alias the frame slot and observe later
+		// writes (Go interface conversion copies the value; match that here).
+		if v.IsValid() && v.CanAddr() {
+			nv := reflect.New(v.Type()).Elem()
+			nv.Set(v)
+			v = nv
+		}
 		return reflect.ValueOf(valueInterface{nod, v})
 	}
 }

@@ -101,7 +101,11 @@ func (check typecheck) addressExpr(n *node) error {
 			c0 = c0.child[1]
 			continue
 		case starExpr:
-			c0 = c0.child[0]
+			// Dereferencing a pointer always yields an addressable value, so
+			// &*p is valid and denotes p itself (as in gc), whatever p is,
+			// even the result of a call (e.g. a conversion), which on its own
+			// would not be addressable.
+			found = true
 			continue
 		case indexExpr, sliceExpr:
 			c := c0.child[0]
