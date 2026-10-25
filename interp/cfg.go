@@ -1448,7 +1448,7 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 				// Operand of a const-evaluated unsafe builtin is never evaluated
 				// (gc parity): nop the whole operand subtree. Dense literals
 				// additionally skip frame registration (compositeLitExpr case).
-				if bname == bltnSizeof || bname == "unsafe.Alignof" || bname == "unsafe.Offsetof" {
+				if bname == bltnSizeof || bname == bltnAlignof || bname == bltnOffsetof {
 					for _, a := range n.child[1:] {
 						a.Walk(func(x *node) bool { x.gen = nop; return true }, nil)
 					}
