@@ -244,6 +244,7 @@ const (
 	aQuo
 	aQuoAssign
 	aRange
+	aRangeAssign
 	aRecv
 	aRem
 	aRemAssign
@@ -306,6 +307,7 @@ var actions = [...]string{
 	aQuo:          "/",
 	aQuoAssign:    "/=",
 	aRange:        "range",
+	aRangeAssign:  "rangeAssign",
 	aRecv:         "<-",
 	aRem:          "%",
 	aRemAssign:    "%=",
@@ -820,7 +822,13 @@ func (interp *Interpreter) ast(f ast.Node) (string, *node, error) {
 		case *ast.RangeStmt:
 			// Insert a missing ForRangeStmt for AST correctness
 			n := addChild(&root, anc, pos, forRangeStmt, aNop)
-			r := addChild(&root, astNode{n, nod}, pos, rangeStmt, aRange)
+			// Distinguish assign (for k, v = range ...) from define (for k, v := range ...):
+			// with assign, iteration variables must already exist and are reused, not shadowed.
+			ract := aRange
+			if a.Tok == token.ASSIGN {
+				ract = aRangeAssign
+			}
+			r := addChild(&root, astNode{n, nod}, pos, rangeStmt, ract)
 			st.push(r, nod)
 			if a.Key == nil {
 				// range not in an assign expression: insert a "_" key variable to store iteration index
