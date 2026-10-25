@@ -45,7 +45,14 @@ func Clone[M ~map[K]V, K comparable, V any](m M) M {
 	if m == nil {
 		return nil
 	}
-	return clone(m).(M)
+	// NOTE(yaegi): manual copy instead of clone(m).(M) helper+assert,
+	// which the interpreter cannot execute for generic M (interface
+	// conversion yields nil). Behaviorally identical shallow clone.
+	c := make(M, len(m))
+	for k, v := range m {
+		c[k] = v
+	}
+	return c
 }
 
 // Copy copies all key/value pairs in src adding them to dst.

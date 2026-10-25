@@ -1,7 +1,9 @@
 package interp
 
 import (
+	"errors"
 	"path"
+	"strings"
 )
 
 // gta performs a global types analysis on the AST, registering types,
@@ -194,6 +196,12 @@ func (interp *Interpreter) gta(root *node, rpath, importPath, pkgName string) ([
 				if rcvrtype.cat == genericT {
 					// generate methods for already instantiated receivers
 					for _, it := range rcvrtype.instance {
+						if it.incomplete {
+							// Dependencies not ready; defer compilation to a revisit.
+							pendMethod(it, pendingMethod{node: n, scope: sc, types: it.node.anc.param})
+							revisit = append(revisit, n)
+							continue
+						}
 						if err = genMethod(interp, sc, it, n, it.node.anc.param); err != nil {
 							return false
 						}
@@ -234,13 +242,28 @@ func (interp *Interpreter) gta(root *node, rpath, importPath, pkgName string) ([
 				case "_": // no import of symbols
 				case ".": // import symbols in current scope
 					for n, v := range pkg {
-						typ := v.Type()
-						kind := binSym
-						if isBinType(v) {
-							typ = typ.Elem()
-							kind = typeSym
+						if gf, ok := v.Interface().(GenericFunc); ok {
+							// Skip recompiling generics only when the dot-imported
+							// package is the one being compiled (e.g. the Use
+							// synthetic wrapper). Require a path-segment boundary
+							// so packages which merely share a name suffix
+							// (example.com/amain vs main) still get compiled.
+							samePath := ipath == importPath || strings.HasSuffix(ipath, "/"+importPath)
+							if !samePath {
+								if _, cerr := interp.Compile(string(gf)); cerr != nil {
+									err = cerr
+									return false
+								}
+							}
+						} else {
+							typ := v.Type()
+							kind := binSym
+							if isBinType(v) {
+								typ = typ.Elem()
+								kind = typeSym
+							}
+							sc.sym[n] = &symbol{kind: kind, typ: valueTOf(typ, withScope(sc)), rval: v}
 						}
-						sc.sym[n] = &symbol{kind: kind, typ: valueTOf(typ, withScope(sc)), rval: v}
 					}
 				default: // import symbols in package namespace
 					if name == "" {
@@ -326,6 +349,14 @@ func (interp *Interpreter) gta(root *node, rpath, importPath, pkgName string) ([
 				// Create an aliased type in the current scope
 				sc.sym[typeName] = &symbol{kind: typeSym, node: n, typ: typ}
 				n.typ = typ
+				if !typ.isComplete() {
+					// The aliased type refers to a type which is not fully defined yet
+					// (e.g. declared later in the package). Defer it to a later pass, as
+					// done for defined types below, so forward references resolve instead
+					// of freezing a nilT placeholder into the alias.
+					revisit = append(revisit, n)
+					return false
+				}
 				break
 			}
 
@@ -410,6 +441,11 @@ func (interp *Interpreter) gtaRetry(nodes []*node, importPath, pkgName string) e
 		n := revisit[0]
 		switch n.kind {
 		case typeSpec, typeSpecAssign:
+			if n.typ == nil {
+				// Adequate nodeType failures leave no type; report a clean
+				// error instead of panicking in definedType.
+				return n.cfgErrorf("type definition incomplete")
+			}
 			if err := definedType(n.typ); err != nil {
 				return err
 			}
@@ -424,34 +460,52 @@ func (interp *Interpreter) gtaRetry(nodes []*node, importPath, pkgName string) e
 }
 
 func definedType(typ *itype) error {
+	return definedTypeSeen(typ, map[*itype]bool{})
+}
+
+var errNilType = errors.New("interp: nil type in constant definition loop")
+
+// definedTypeSeen reports whether typ is fully defined, treating cyclic
+// references as defined (cf. seenNode handling in nodeType2). Unlike
+// isComplete it cannot loop forever on recursive types. A nil type is
+// reported as an error instead of panicking.
+func definedTypeSeen(typ *itype, seen map[*itype]bool) error {
+	if typ == nil {
+		return errNilType
+	}
+	if seen[typ] {
+		return nil
+	}
 	if !typ.incomplete {
 		return nil
 	}
+	seen[typ] = true
+	defer delete(seen, typ)
 	switch typ.cat {
 	case interfaceT, structT:
 		for _, f := range typ.field {
-			if err := definedType(f.typ); err != nil {
+			if err := definedTypeSeen(f.typ, seen); err != nil {
 				return err
 			}
 		}
 	case funcT:
 		for _, t := range typ.arg {
-			if err := definedType(t); err != nil {
+			if err := definedTypeSeen(t, seen); err != nil {
 				return err
 			}
 		}
 		for _, t := range typ.ret {
-			if err := definedType(t); err != nil {
+			if err := definedTypeSeen(t, seen); err != nil {
 				return err
 			}
 		}
 	case mapT:
-		if err := definedType(typ.key); err != nil {
+		if err := definedTypeSeen(typ.key, seen); err != nil {
 			return err
 		}
 		fallthrough
 	case linkedT, arrayT, chanT, chanSendT, chanRecvT, ptrT, variadicT:
-		if err := definedType(typ.val); err != nil {
+		if err := definedTypeSeen(typ.val, seen); err != nil {
 			return err
 		}
 	case nilT:

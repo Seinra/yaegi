@@ -2448,7 +2448,7 @@ func dec(n *node) {
 			}
 			return next
 		}
-	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
 		v0 := genValueUint(c0)
 		n.exec = func(f *frame) bltn {
 			v, i := v0(f)
@@ -2504,7 +2504,7 @@ func inc(n *node) {
 			}
 			return next
 		}
-	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
 		v0 := genValueUint(c0)
 		n.exec = func(f *frame) bltn {
 			v, i := v0(f)

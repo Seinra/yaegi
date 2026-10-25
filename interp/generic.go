@@ -5,6 +5,13 @@ import (
 	"sync/atomic"
 )
 
+// GenericFunc contains the code of a generic function.
+// This is used in the `yaegi extract` command to represent generic functions
+// instead of the actual value of the function, since you cannot get the
+// [reflect.Value] of a generic function. This is then used to interpret the
+// function when it is imported in yaegi.
+type GenericFunc string
+
 // adot produces an AST dot(1) directed acyclic graph for the given node. For debugging only.
 // func (n *node) adot() { n.astDot(dotWriter(n.interp.dotCmd), n.ident) }
 
@@ -16,7 +23,7 @@ func genAST(sc *scope, root *node, types []*itype) (*node, bool, error) {
 	rtname := ""
 	recvrPtr := false
 	fixNodes := []*node{}
-	var gtree func(*node, *node) (*node, error)
+	var gtree func(n, anc *node, inBody bool) (*node, error)
 	sname := root.child[0].ident + "["
 	if root.kind == funcDecl {
 		sname = root.child[1].ident + "["
@@ -29,7 +36,7 @@ func genAST(sc *scope, root *node, types []*itype) (*node, bool, error) {
 	}
 	sname = strings.TrimSuffix(sname, ",") + "]"
 
-	gtree = func(n, anc *node) (*node, error) {
+	gtree = func(n, anc *node, inBody bool) (*node, error) {
 		nod := copyNode(n, anc, false)
 		switch n.kind {
 		case funcDecl, funcType:
@@ -39,6 +46,21 @@ func genAST(sc *scope, root *node, types []*itype) (*node, bool, error) {
 			// Replace generic type by instantiated one.
 			nt, ok := typeParam[n.ident]
 			if !ok {
+				// The clone may refer to names which are visible at the
+				// definition site but not at the instantiation site (types
+				// and packages of the generic package). Resolve them in the
+				// definition scope, so nested instantiations complete instead
+				// of degrading to incomplete types, except in function bodies
+				// which compile in the definition scope already. Names visible
+				// at the instantiation site keep their normal resolution, as
+				// well as declaration names which are never resolved.
+				if !inBody && !isGenericName(root, n) {
+					if _, _, found := sc.lookup(n.ident); !found {
+						if typ := lookupDefinitionType(root, n.ident); typ != nil {
+							nod.typ = typ
+						}
+					}
+				}
 				break
 			}
 			nod = copyNode(nt, anc, true)
@@ -58,7 +80,7 @@ func genAST(sc *scope, root *node, types []*itype) (*node, bool, error) {
 
 		case fieldList:
 			//  Node is the type parameters list of a generic function.
-			if root.kind == funcDecl && n.anc == root.child[2] && childPos(n) == 0 {
+			if root.kind == funcDecl && n.anc == root.child[2] && childPos(n) == 0 && len(types) > 0 {
 				// Fill the types lookup table used for type substitution.
 				for _, c := range n.child {
 					l := len(c.child) - 1
@@ -140,7 +162,7 @@ func genAST(sc *scope, root *node, types []*itype) (*node, bool, error) {
 		}
 
 		for _, c := range n.child {
-			gn, err := gtree(c, nod)
+			gn, err := gtree(c, nod, inBody || c.kind == blockStmt)
 			if err != nil {
 				return nil, err
 			}
@@ -153,7 +175,7 @@ func genAST(sc *scope, root *node, types []*itype) (*node, bool, error) {
 		return nod, true, nil
 	}
 
-	r, err := gtree(root, root.anc)
+	r, err := gtree(root, root.anc, false)
 	if err != nil {
 		return nil, false, err
 	}
@@ -177,6 +199,43 @@ func genAST(sc *scope, root *node, types []*itype) (*node, bool, error) {
 	}
 	// r.adot() // Used for debugging only.
 	return r, false, nil
+}
+
+// isGenericName reports whether n is the declared name of a generic type or
+// function being cloned, which is never resolved and must keep no stamped type.
+func isGenericName(root, n *node) bool {
+	if n.kind != identExpr {
+		return false
+	}
+	switch root.kind {
+	case typeSpec:
+		return len(root.child) > 0 && n == root.child[0]
+	case funcDecl:
+		index := 0
+		if len(root.child) > 0 && root.child[0].kind == fieldList {
+			index = 1
+		}
+		return len(root.child) > index && n == root.child[index]
+	}
+	return false
+}
+
+// lookupDefinitionType resolves a bare identifier in the scope where a generic
+// definition was declared, for nodes cloned by genAST. It returns the declared
+// type for visible type and package symbols with complete types, or nil when the
+// name is not visible there, so callers keep the normal resolution path.
+func lookupDefinitionType(root *node, ident string) *itype {
+	if root == nil || root.scope == nil {
+		return nil
+	}
+	if sym, _, found := root.scope.lookup(ident); found && sym.typ != nil && !sym.typ.incomplete &&
+		(sym.kind == typeSym || sym.kind == pkgSym) {
+		return sym.typ
+	}
+	if sym, ok := lookupPackageByBase(root.scope, ident); ok && sym.typ != nil && !sym.typ.incomplete {
+		return sym.typ
+	}
+	return nil
 }
 
 func copyNode(n, anc *node, recursive bool) *node {
@@ -222,80 +281,138 @@ func inferTypesFromCall(sc *scope, fun *node, args []*node) ([]*itype, error) {
 		}
 	}
 
-	var inferTypes func(*itype, *itype) ([]*itype, error)
-	inferTypes = func(param, input *itype) ([]*itype, error) {
-		switch param.cat {
-		case chanT, ptrT, sliceT:
-			return inferTypes(param.val, input.val)
-
-		case mapT:
-			k, err := inferTypes(param.key, input.key)
-			if err != nil {
-				return nil, err
-			}
-			v, err := inferTypes(param.val, input.val)
-			if err != nil {
-				return nil, err
-			}
-			return append(k, v...), nil
-
-		case structT:
-			lt := []*itype{}
-			for i, f := range param.field {
-				nl, err := inferTypes(f.typ, input.field[i].typ)
-				if err != nil {
-					return nil, err
+	// inferred collects the concrete type for each type parameter name.
+	// unify matches parameter shapes against argument types and records by
+	// name, so multi-name fields (s1, s2 S) and constraint-only type params
+	// (E in S ~[]E, K/V in M ~map[K]V) resolve correctly. It replaces the
+	// old positional inferTypes, which dropped E/K/V entirely.
+	inferred := map[string]*itype{}
+	// record stores input under name and, when name looks like a suffixed
+	// copy of a declared type param (e.g. V1/V2 for V in Equal[M1, M2]),
+	// also under the base name so declaration-order emit finds it.
+	record := func(name string, input *itype) {
+		if name == "" || input == nil {
+			return
+		}
+		if _, ok := inferred[name]; !ok {
+			inferred[name] = input
+		}
+		// Strip trailing digits to find base (V1 -> V). Only apply when
+		// the full name is not itself a declared param but base is.
+		if paramTypes[name] == nil {
+			base := strings.TrimRight(name, "0123456789")
+			if base != name && paramTypes[base] != nil {
+				if _, ok := inferred[base]; !ok {
+					inferred[base] = input
 				}
-				lt = append(lt, nl...)
 			}
-			return lt, nil
-
+		}
+	}
+	var unify func(param, input *itype)
+	unify = func(param, input *itype) {
+		if param == nil || input == nil {
+			return
+		}
+		switch param.cat {
+		case genericT:
+			record(param.name, input)
+			// Decompose the type parameter constraint as well, so
+			// constraint-only type params get inferred from the same arg.
+			if param.val != nil {
+				unify(param.val, input)
+			}
+		case nilT:
+			// Caller-scope view of a type parameter (the #1700 nil-type
+			// case): record the argument when the name is a known type param.
+			if paramTypes[param.name] != nil {
+				record(param.name, input)
+			}
+		case chanT, ptrT, sliceT, arrayT:
+			if param.val != nil && input.val != nil {
+				unify(param.val, input.val)
+			}
+		case variadicT:
+			// Variadic params (vals ...T) receive individual elements,
+			// not a slice, when called as f(a, b). Infer T directly
+			// from the element type; also handle f(slice...) where
+			// input is a slice/array carrying the element in val.
+			if param.val != nil {
+				if input.val != nil && (input.cat == sliceT || input.cat == arrayT) {
+					unify(param.val, input.val)
+				} else {
+					unify(param.val, input)
+				}
+			}
+		case mapT:
+			unify(param.key, input.key)
+			unify(param.val, input.val)
+		case structT:
+			for i, f := range param.field {
+				if i >= len(input.field) {
+					break
+				}
+				unify(f.typ, input.field[i].typ)
+			}
 		case funcT:
-			lt := []*itype{}
 			for i, t := range param.arg {
 				if i >= len(input.arg) {
 					break
 				}
-				nl, err := inferTypes(t, input.arg[i])
-				if err != nil {
-					return nil, err
-				}
-				lt = append(lt, nl...)
+				unify(t, input.arg[i])
 			}
 			for i, t := range param.ret {
 				if i >= len(input.ret) {
 					break
 				}
-				nl, err := inferTypes(t, input.ret[i])
-				if err != nil {
-					return nil, err
-				}
-				lt = append(lt, nl...)
+				unify(t, input.ret[i])
 			}
-			return lt, nil
-
-		case nilT:
-			if paramTypes[param.name] != nil {
-				return []*itype{input}, nil
-			}
-
-		case genericT:
-			return []*itype{input}, nil
 		}
-		return nil, nil
+	}
+
+	// resolveParam prefers the generic function's own scope, where type
+	// parameters are visible as genericT with their constraints. The caller
+	// scope sees them as nilT (the #1700 nil-type case), which cannot be
+	// decomposed for constraint-only type params (e.g. E in Equal[S ~[]E]).
+	resolveParam := func(n *node) *itype {
+		if fun.scope != nil {
+			if t, err := nodeType(fun.interp, fun.scope, n); err == nil && t != nil && t.cat == genericT {
+				return t
+			}
+		}
+		t, _ := nodeType(fun.interp, sc, n)
+		return t
 	}
 
 	types := []*itype{}
-	for i, c := range ftn.child[1].child {
-		typ, err := nodeType(fun.interp, sc, c.lastChild())
-		if err != nil {
-			return nil, err
+	ai := 0 // index into args, advancing per expanded param name
+	for _, c := range ftn.child[1].child {
+		typ := resolveParam(c.lastChild())
+		if typ == nil {
+			continue
 		}
-		lt, err := inferTypes(typ, args[i].typ)
-		if err != nil {
-			return nil, err
+		names := c.child[:len(c.child)-1]
+		if len(names) == 0 {
+			names = c.child
 		}
-		types = append(types, lt...)
+		for range names {
+			// A missing argument (fewer args than params) leaves the
+			// type param uninferred; genAST then reports the first
+			// undefined one, and check.arguments reports arity.
+			if ai < len(args) {
+				unify(typ, args[ai].typ)
+				ai++
+			}
+		}
+	}
+	// Emit inferred types in type parameter declaration order, so genAST
+	// maps each type param positionally. Missing entries stay missing and
+	// genAST reports the first undefined one, as before.
+	for _, c := range ftn.child[0].child {
+		for _, cc := range c.child[:len(c.child)-1] {
+			if t, ok := inferred[cc.ident]; ok {
+				types = append(types, t)
+			}
+		}
 	}
 
 	return types, nil

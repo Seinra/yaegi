@@ -53,6 +53,7 @@ var builtin = [...]bltnGenerator{
 	aQuo:          quo,
 	aQuoAssign:    quoAssign,
 	aRange:        _range,
+	aRangeAssign:  _range,
 	aRecv:         recv,
 	aRem:          rem,
 	aRemAssign:    remAssign,
@@ -325,6 +326,45 @@ func typeAssert(n *node, withResult, withOk bool) {
 				}()
 			}
 			if !ok {
+				// The asserted value may be a binary (non-interpreted)
+				// concrete value, e.g. a *sync.Pool returned from a binary
+				// call, asserted to an interpreted interface. Verify its
+				// method set and wrap it, so the rest of the flow applies
+				// unchanged. Without this, valid programs panic with a
+				// misleading "nil is not X" error.
+				if c0.typ.cat == valueT {
+					if bv := valf; bv.IsValid() {
+						if bv.Kind() == reflect.Interface {
+							if bv.IsNil() {
+								bv = reflect.Value{}
+							} else {
+								bv = bv.Elem()
+							}
+						}
+						if bv.IsValid() {
+							m1 := typ.methods()
+							matched := true
+							for k, meth1 := range m1 {
+								bm, ok := bv.Type().MethodByName(k)
+								if !ok {
+									matched = false
+									break
+								}
+								meth0, err := stripReceiverFromArgs(bm.Type.String())
+								if err != nil || meth0 != meth1 {
+									matched = false
+									break
+								}
+							}
+							if matched {
+								v = valueInterface{node: c1, value: bv}
+								ok = true
+							}
+						}
+					}
+				}
+			}
+			if !ok {
 				if !withOk {
 					panic(n.cfgErrorf("interface conversion: nil is not %v", typID))
 				}
@@ -428,8 +468,18 @@ func typeAssert(n *node, withResult, withOk bool) {
 				v = val.value
 				leftType = val.node.typ.rtype
 			} else {
-				v = v.Elem()
-				leftType = v.Type()
+				// Unwrap only a non-nil interface value which does not already
+				// satisfy the assertion. Concrete values assert directly (Elem
+				// would panic on them), and a nil interface (or invalid value)
+				// is normalized below so the assertion fails, as in gc.
+				if v.IsValid() && v.Kind() == reflect.Interface && !v.IsNil() && !canAssertTypes(v.Type(), rtype) {
+					v = v.Elem()
+				}
+				if v.IsValid() && (v.Kind() != reflect.Interface || !v.IsNil()) {
+					leftType = v.Type()
+				} else {
+					v = reflect.Value{}
+				}
 				ok = true
 			}
 			ok = v.IsValid()
@@ -491,7 +541,13 @@ func typeAssert(n *node, withResult, withOk bool) {
 		}
 	case n.child[0].typ.cat == valueT || n.child[0].typ.cat == errorT:
 		n.exec = func(f *frame) bltn {
-			v := value(f).Elem()
+			v := value(f)
+			// Unwrap only interface values. Concrete values (e.g. an
+			// interpreted struct stored raw in an error frame) assert
+			// directly; Elem would panic on them.
+			if v.IsValid() && v.Kind() == reflect.Interface {
+				v = v.Elem()
+			}
 			ok := v.IsValid()
 			if setStatus {
 				defer func() {
@@ -650,6 +706,39 @@ func assignFromCall(n *node) {
 		}
 		dvalue[i] = genValue(n.child[i])
 	}
+	// wrap converts the ith call result to the destination type when the
+	// destination is a non-empty binary interface and the result is an
+	// interpreted concrete value (e.g. r, err = newRows(...) into
+	// r driver.Rows). Without the wrapper, reflect rejects the method-less
+	// interpreted value when stored in the binary-typed destination slot,
+	// as for other interface-boundary shapes. Nil when no conversion is
+	// needed (raw path preserved, e.g. error results keep identity).
+	wrap := make([]func(*frame) reflect.Value, l)
+	for i := range wrap {
+		c := n.child[i]
+		if c.ident == "_" {
+			continue
+		}
+		destType := c.typ
+		var srcType *itype
+		if ft := ncall.child[0].typ; ft != nil && i < len(ft.ret) {
+			srcType = ft.ret[i]
+		}
+		if srcType == nil || !isInterfaceBin(destType) || destType.rtype.NumMethod() == 0 || destType.cat == errorT {
+			continue
+		}
+		if srcType.cat == valueT || srcType.cat == errorT || srcType.cat == nilT {
+			continue
+		}
+		// Proxy the call node: read this result's temp slot with the
+		// concrete result type, so the wrapper is built from the same
+		// method set as other interface-boundary shapes. The copy keeps
+		// the original call node untouched.
+		proxy := *ncall
+		proxy.findex = ncall.findex + i
+		proxy.typ = srcType
+		wrap[i] = genInterfaceWrapper(&proxy, destType.rtype)
+	}
 	next := getExec(n.tnext)
 	n.exec = func(f *frame) bltn {
 		for i, v := range dvalue {
@@ -658,6 +747,9 @@ func assignFromCall(n *node) {
 			}
 			s := f.data[ncall.findex+i]
 			c := n.child[i]
+			if w := wrap[i]; w != nil {
+				s = w(f)
+			}
 			if n.kind == defineXStmt && !c.redeclared {
 				// Recreate destination value in case of define statement,
 				// to preserve previous value possibly in use by a closure.
@@ -1229,6 +1321,14 @@ func call(n *node) {
 					continue
 				}
 				values = append(values, func(f *frame) reflect.Value {
+					if v := f.data[ind]; v.IsValid() {
+						if vi, ok := v.Interface().(valueInterface); ok && vi.node != nil && vi.node.typ != nil {
+							// The return site already wrapped the value with the
+							// concrete type node; preserve it, as the callee
+							// signature node below carries no usable type.
+							return v
+						}
+					}
 					return reflect.ValueOf(valueInterface{node: cc0.typ.ret[j].node, value: f.data[ind]})
 				})
 			}
@@ -1498,6 +1598,28 @@ func callBin(n *node) {
 			}
 		case isRegularCall(c):
 			// Handle nested function calls: pass returned values as arguments
+			if len(c.child[0].typ.ret) == 1 {
+				// A single result feeding a non-empty binary interface parameter
+				// (e.g. sql.Register(name, newDriver())) must go through the
+				// interface wrapper, as for other argument shapes below, else
+				// reflect rejects the interpreted value which carries no binary
+				// methods. Other shapes keep the historical raw path.
+				var defType reflect.Type
+				if variadic >= 0 && i+rcvrOffset >= variadic {
+					defType = funcType.In(variadic)
+				} else {
+					defType = funcType.In(rcvrOffset + i)
+				}
+				if getMapType != nil {
+					if rt := getMapType(c.typ); rt != nil {
+						defType = rt
+					}
+				}
+				if defType != nil && defType.Kind() == reflect.Interface && defType.NumMethod() > 0 && c.typ.cat != valueT {
+					values = append(values, genInterfaceWrapper(c, defType))
+					break
+				}
+			}
 			for j := range c.child[0].typ.ret {
 				ind := c.findex + j
 				values = append(values, func(f *frame) reflect.Value { return valueInterfaceValue(f.data[ind]) })
@@ -1977,66 +2099,83 @@ func getMethodByName(n *node) {
 	n.exec = func(f *frame) bltn {
 		// The interface object must be directly accessible, or embedded in a struct (exported anonymous field).
 		val0 := value0(f)
-		val, ok := value0(f).Interface().(valueInterface)
-		if !ok {
-			// Search the first embedded valueInterface.
+		var candidates []valueInterface
+		if val, ok := value0(f).Interface().(valueInterface); ok {
+			candidates = []valueInterface{val}
+		} else {
+			// Collect every embedded valueInterface candidate. The
+			// first match is not necessarily the one which carries
+			// the method (e.g. a holder embedding two interfaces
+			// where the call targets the second), so MethodByName
+			// is attempted on all candidates, in field order, until
+			// one matches. Field order keeps single-interface and
+			// first-interface dispatch identical to before.
 			for val0.Kind() == reflect.Ptr {
 				val0 = val0.Elem()
 			}
 			for i := 0; i < val0.NumField(); i++ {
 				fld := val0.Type().Field(i)
-				if !fld.Anonymous || !fld.IsExported() {
+				// Note: do not filter on fld.Anonymous. Struct reflect types built
+				// in refType mark Anonymous only for single-field structs (see
+				// type.go, golang/go#15924 workaround), so multi-field holders
+				// of an embedded interface (e.g. holder{Tag, Namer}) report
+				// Anonymous == false. The CFG already gated this dispatch on
+				// promoted (embedded) methods, so any exported valueInterface
+				// field is a valid candidate here.
+				if !fld.IsExported() {
 					continue
 				}
-				if val, ok = val0.Field(i).Interface().(valueInterface); ok {
-					break
-					// TODO: should we keep track of all the vals that are indeed valueInterface,
-					// so that later on we can call MethodByName on all of them until one matches?
+				if val, ok := val0.Field(i).Interface().(valueInterface); ok {
+					candidates = append(candidates, val)
 				}
 			}
-			if !ok {
+			if len(candidates) == 0 {
 				panic(n.cfgErrorf("invalid interface value %v", val0))
 			}
 		}
-		// Traverse nested interface values to get the concrete value.
-		for {
-			v, ok := val.value.Interface().(valueInterface)
-			if !ok {
-				break
+		for _, cand := range candidates {
+			val := cand
+			// Traverse nested interface values to get the concrete value.
+			for {
+				v, ok := val.value.Interface().(valueInterface)
+				if !ok {
+					break
+				}
+				val = v
 			}
-			val = v
-		}
 
-		if met := val.value.MethodByName(name); met.IsValid() {
-			getFrame(f, l).data[i] = met
-			return next
-		}
-
-		typ := val.node.typ
-		if typ.node == nil && typ.cat == valueT {
-			// It happens with a var of empty interface type, that has value of concrete type
-			// from runtime, being asserted to "user-defined" interface.
-			if _, ok := typ.rtype.MethodByName(name); !ok {
-				panic(n.cfgErrorf("method not found: %s", name))
+			if met := val.value.MethodByName(name); met.IsValid() {
+				getFrame(f, l).data[i] = met
+				return next
 			}
+
+			typ := val.node.typ
+			if typ.node == nil && typ.cat == valueT {
+				// It happens with a var of empty interface type, that has value of concrete type
+				// from runtime, being asserted to "user-defined" interface.
+				if _, ok := typ.rtype.MethodByName(name); ok {
+					return next
+				}
+				continue
+			}
+
+			// Finally search method recursively in embedded valueInterfaces.
+			r, m, li := lookupMethodValue(val, name)
+			if r.IsValid() {
+				getFrame(f, l).data[i] = r
+				return next
+			}
+			if m == nil {
+				continue
+			}
+
+			nod := *m
+			nod.val = &nod
+			nod.recv = &receiver{nil, val.value, li}
+			getFrame(f, l).data[i] = genFuncValue(&nod)(f)
 			return next
 		}
-
-		// Finally search method recursively in embedded valueInterfaces.
-		r, m, li := lookupMethodValue(val, name)
-		if r.IsValid() {
-			getFrame(f, l).data[i] = r
-			return next
-		}
-		if m == nil {
-			panic(n.cfgErrorf("method not found: %s", name))
-		}
-
-		nod := *m
-		nod.val = &nod
-		nod.recv = &receiver{nil, val.value, li}
-		getFrame(f, l).data[i] = genFuncValue(&nod)(f)
-		return next
+		panic(n.cfgErrorf("method not found: %s", name))
 	}
 }
 
@@ -2780,10 +2919,13 @@ func doComposite(n *node, hasType bool, keyed bool) {
 		case d.Kind() == reflect.Ptr:
 			d.Set(a.Addr())
 		case destInterface:
-			if len(destType(n).field) > 0 {
+			if len(destType(n).field) > 0 && d.Type() == valueInterfaceType {
 				d.Set(reflect.ValueOf(valueInterface{n, a}))
 				break
 			}
+			// The composite slot carries the composite struct type (e.g. the
+			// composite is the source of an assignment to an interface). Store
+			// the raw value; readers wrap it in a valueInterface as needed.
 			d.Set(a)
 		default:
 			getFrame(f, l).data[frameIndex] = a
@@ -3012,6 +3154,165 @@ func rangeMap(n *node) {
 	}
 }
 
+// rangeFunc executes a range-over-func loop (Go 1.23+ iterator sequence).
+// The sequence is called once with a yield function; each yield sets the
+// loop variables and steps the loop body chain inline, so iteration stays
+// lazy (breaking early never pulls further values) and control flow
+// (break, continue, goto, return) behaves as in compiled code:
+//   - a step returning the loop back edge marks one completed iteration and
+//     resumes the sequence (yield returns true);
+//   - any other step is a loop escape recorded by yield (returning false to
+//     stop the sequence) and replayed once the sequence call returns.
+//
+// rangeFuncMark is returned by wrapped loop back edges (see rangeFunc) to
+// signal one completed body iteration. It is a stable package level value,
+// recognized by pointer, and never invoked.
+var rangeFuncMark bltn = func(*frame) bltn { return nil }
+
+// rangeFuncEscape is returned by wrapped loop escapes (see markRangeFlow)
+// to signal that the body left the loop. The escape target is recorded in
+// the per-execution rangeFuncState. Stable package level value, recognized
+// by pointer, never invoked. Its body must stay textually distinct from
+// rangeFuncMark above: both sentinels are recognized by code pointer, so a
+// toolchain which merged the two identical literals would silently alias
+// iteration-end and loop-escape. The rangefunc corpus (break, continue,
+// goto, return shapes) pins correct loop control, and rangeFunc asserts
+// the distinction at setup so aliasing fails loudly instead of silently.
+var rangeFuncEscape bltn = func(*frame) bltn { return nil }
+
+// rangeFuncState carries per loop execution control flow across the
+// sequence call boundary. The escape target replays once the sequence
+// returns: the loop exit for break, the label for goto, nil for return.
+type rangeFuncState struct {
+	escaped      bool
+	escapeTarget bltn
+}
+
+// rangeFuncStateType returns the interpreter type of a rangeFuncState slot.
+func rangeFuncStateType() *itype {
+	return valueTOf(reflect.TypeOf((*rangeFuncState)(nil)))
+}
+func rangeFunc(rangeNode *node) {
+	var keyIndex, valIndex int
+	var seqNode *node
+	hasValue := false
+	if len(rangeNode.child) == 4 {
+		keyIndex = rangeNode.child[0].findex
+		seqNode = rangeNode.child[2]
+		if rangeNode.child[1].ident != "_" {
+			valIndex = rangeNode.child[1].findex
+			hasValue = true
+		}
+	} else {
+		keyIndex = rangeNode.child[0].findex
+		seqNode = rangeNode.child[1]
+	}
+	seqValue := genFuncValue(seqNode)
+	bodyEntry := rangeNode.tnext
+	bodyStart := getExec(bodyEntry)
+	loopExit := getExec(rangeNode.fnext)
+	var bodyNode *node
+	if len(rangeNode.child) == 4 {
+		bodyNode = rangeNode.child[3]
+	} else {
+		bodyNode = rangeNode.child[2]
+	}
+	markPtr := reflect.ValueOf(rangeFuncMark).Pointer()
+	escapePtr := reflect.ValueOf(rangeFuncEscape).Pointer()
+	if markPtr == escapePtr {
+		// A merged-literal toolchain aliased the two sentinels; loop
+		// control (mark vs escape) would silently misbehave. Fail here,
+		// loudly, instead of corrupting every range-over-func loop.
+		panic("yaegi: rangeFunc sentinels are aliased (mark == escape), loop control would silently misbehave")
+	}
+	// The loop state slot was added in the range CFG case just before the
+	// key slot (sc.add(rangeFuncStateType()) precedes the key sc.add),
+	// mirroring the rangeMap iterator slot convention. The slot holds an
+	// interpreter-internal *rangeFuncState; no guest syntax addresses it,
+	// so a direct-syntax kill test is impossible and the exec-site
+	// assertion below is the regression lock (interior-guard rule).
+	stateIndex := rangeNode.child[0].findex - 1
+	loopExec := func(loopFrame *frame) bltn {
+		seq := seqValue(loopFrame)
+		yieldType := seq.Type().In(0)
+		sv := loopFrame.data[stateIndex]
+		if !sv.IsValid() {
+			panic("yaegi: rangeFunc state slot holds no value (child[0].findex-1 layout broken)")
+		}
+		loopState, ok := sv.Interface().(*rangeFuncState)
+		if !ok {
+			panic("yaegi: rangeFunc state slot corrupted (child[0].findex-1 layout broken)")
+		}
+		yield := reflect.MakeFunc(yieldType, func(yieldArgs []reflect.Value) []reflect.Value {
+			if len(yieldArgs) > 0 {
+				loopFrame.data[keyIndex].Set(yieldArgs[0])
+				if hasValue && len(yieldArgs) > 1 {
+					loopFrame.data[valIndex].Set(yieldArgs[1])
+				}
+			}
+			step := bodyStart
+			curNode := bodyEntry
+			for step != nil && loopFrame.runid() == rangeNode.interp.runid() {
+				next := step(loopFrame)
+				if next == nil {
+					loopState.escaped = true // function return, replayed as nil below
+					return []reflect.Value{reflect.ValueOf(false)}
+				}
+				if reflect.ValueOf(next).Pointer() == markPtr {
+					return []reflect.Value{reflect.ValueOf(true)}
+				}
+				if reflect.ValueOf(next).Pointer() == escapePtr {
+					return []reflect.Value{reflect.ValueOf(false)}
+				}
+				// Advance node tracking alongside the exec chain, as in runCfg.
+				var nextNode *node
+				switch {
+				case isExecNode(curNode.tnext, next):
+					nextNode = curNode.tnext
+				case isExecNode(curNode.fnext, next):
+					nextNode = curNode.fnext
+				default:
+					nextNode = originalExecNode(curNode, next)
+				}
+				inBody := false
+				for parent := nextNode; parent != nil; parent = parent.anc {
+					if parent == bodyNode {
+						inBody = true
+						break
+					}
+				}
+				if inBody {
+					step, curNode = next, nextNode
+					continue
+				}
+				loopState.escaped = true
+				loopState.escapeTarget = next
+				return []reflect.Value{reflect.ValueOf(false)}
+			}
+			loopState.escaped = true // interpreter reset, unwind the sequence
+			return []reflect.Value{reflect.ValueOf(false)}
+		})
+		seq.Call([]reflect.Value{yield})
+		if !loopState.escaped {
+			return loopExit
+		}
+		return loopState.escapeTarget
+	}
+	// Install the loop exec. Back edge sources and escapes in the body were
+	// wrapped by markRangeFlow during setExec, so iteration end and loop
+	// exit arrive as stable markers.
+	rangeNode.exec = loopExec
+
+	// Init sequence: allocate a fresh per-execution state, then chain into
+	// the loop exec. The range expression itself was evaluated once by the
+	// CFG wiring (o.tnext = k.start) before this init.
+	next := rangeNode.exec
+	rangeNode.child[0].exec = func(loopFrame *frame) bltn {
+		loopFrame.data[stateIndex] = reflect.ValueOf(&rangeFuncState{})
+		return next
+	}
+}
+
 func _case(n *node) {
 	tnext := getExec(n.tnext)
 
@@ -3106,15 +3407,30 @@ func _case(n *node) {
 						return tnext
 					}
 					ival := v.Interface()
-					if ival != nil && rtyp.String() == reflect.TypeOf(ival).String() {
-						destValue(f).Set(elem)
-						return tnext
+					if ival != nil {
+						if ivi, isWrap := ival.(valueInterface); isWrap {
+							// Wrapped value: for an interface case type,
+							// match iff its method set implements the
+							// case type. For a concrete case type, fall
+							// through to the type-identity check below.
+							// Never match on the wrapper name itself.
+							if isInterface(typ) && ivi.node != nil && ivi.node.typ != nil && ivi.value.IsValid() && ivi.node.typ.methods().contains(typ.methods()) {
+								destValue(f).Set(elem)
+								return tnext
+							}
+						} else if rtyp.String() == reflect.TypeOf(ival).String() {
+							// Raw value of matching concrete type.
+							destValue(f).Set(elem)
+							return tnext
+						}
 					}
 					if typ.cat == valueT && rtyp.Kind() == reflect.Interface && elem.IsValid() && elem.Type().Implements(rtyp) {
 						destValue(f).Set(elem)
 						return tnext
 					}
-					return fnext
+					// Fall through to the valueInterface check below, so wrapped
+					// values also match by concrete type identity, not only
+					// by the interface-kind shape above.
 				}
 				if vi, ok := v.Interface().(valueInterface); ok {
 					if vi.node != nil {
@@ -3150,16 +3466,29 @@ func _case(n *node) {
 							return tnext
 						}
 						ival := val.Interface()
-						if ival != nil && rtyp.String() == reflect.TypeOf(ival).String() {
-							destValue(f).Set(elem)
-							return tnext
+						if ival != nil {
+							if ivi, isWrap := ival.(valueInterface); isWrap {
+								// Wrapped value: for an interface case type,
+								// match iff its method set implements the
+								// case type. For a concrete case type, fall
+								// through to the identity checks below.
+								// Never match on the wrapper name itself.
+								if isInterface(typ) && ivi.node != nil && ivi.node.typ != nil && ivi.value.IsValid() && ivi.node.typ.methods().contains(typ.methods()) {
+									destValue(f).Set(elem)
+									return tnext
+								}
+							} else if rtyp.String() == reflect.TypeOf(ival).String() {
+								// Raw value of matching concrete type.
+								destValue(f).Set(elem)
+								return tnext
+							}
 						}
 						if typ.cat == valueT && rtyp.Kind() == reflect.Interface && elem.IsValid() && elem.Type().Implements(rtyp) {
 							destValue(f).Set(elem)
 							return tnext
 						}
 					}
-					return fnext
+					// Fall through to the valueInterface check below.
 				}
 				if vi, ok := val.Interface().(valueInterface); ok {
 					if v := vi.node; v != nil {

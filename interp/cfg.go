@@ -5,6 +5,7 @@ import (
 	"go/constant"
 	"log"
 	"math"
+	"os"
 	"path"
 	"reflect"
 	"strings"
@@ -45,11 +46,57 @@ var constBltn = map[string]func(*node){
 
 const nilIdent = "nil"
 
+// defineLabelSym pre-defines the symbol of the labeled statement labelNode and of
+// all the labeled statements possibly nested in its statement (consecutive
+// labels, as generated for example by ccgo: "zulu_time:\n__10:\n..."),
+// so they are all defined when met during the CFG walk. Only direct children
+// of blocks are scanned by callers, and consecutive labels nest in the AST
+// (the inner labeled statement is the statement of the outer one), so without
+// descending the chain the inner labels stay undefined.
+func defineLabelSym(sc *scope, labelNode *node) {
+	for current := labelNode; ; {
+		label := current.child[0].ident
+		sym := &symbol{kind: labelSym, node: current, index: -1}
+		sc.sym[label] = sym
+		current.sym = sym
+		if len(current.child) < 2 || current.child[1].kind != labeledStmt {
+			break
+		}
+		current = current.child[1]
+	}
+}
+
 func init() {
 	// Use init() to avoid initialization cycles for the following constant builtins.
 	constBltn[bltnAlignof] = alignof
 	constBltn[bltnOffsetof] = offsetof
 	constBltn[bltnSizeof] = sizeof
+}
+
+// hasLinknameDirective reports whether the function declaration at n carries
+// a //go:linkname directive in its immediately preceding comment group.
+// Such declarations have no Go body (assembly or linknamed implementations);
+// they are skipped so importing succeeds, and calling them fails cleanly.
+func hasLinknameDirective(interp *Interpreter, n *node) bool {
+	pos := interp.fset.Position(n.pos)
+	if !pos.IsValid() {
+		return false
+	}
+	src, err := os.ReadFile(pos.Filename)
+	if err != nil {
+		return false
+	}
+	lines := strings.Split(string(src), "\n")
+	for i := pos.Line - 2; i >= 0 && i < len(lines); i-- {
+		line := strings.TrimSpace(lines[i])
+		if !strings.HasPrefix(line, "//") {
+			break
+		}
+		if strings.HasPrefix(strings.TrimSpace(strings.TrimPrefix(line, "//")), "go:linkname") {
+			return true
+		}
+	}
+	return false
 }
 
 // cfg generates a control flow graph (CFG) from AST (wiring successors in AST)
@@ -124,6 +171,7 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 
 		case blockStmt:
 			var rangek, rangev *node
+			var outerK, outerV *symbol
 			if n.anc != nil && n.anc.kind == rangeStmt {
 				// For range block: ensure that array or map type is propagated to iterators
 				// prior to process block. We cannot perform this at RangeStmt pre-order because
@@ -164,6 +212,18 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 							typ = o.typ.val.TypeOf()
 						}
 						switch typ.Kind() {
+						case reflect.Func:
+							// Range over func (Go 1.23+ iterator sequence).
+							sc.add(rangeFuncStateType())
+							yieldParams, ok := seqYieldParams(o.typ)
+							if !ok {
+								err = o.cfgErrorf("cannot range over %s (value of type %s)", rangeSeqName(o), o.typ.id())
+								return false
+							}
+							if ktyp, vtyp, err = rangeIterTypes(sc, o, len(n.anc.child) == 4, k, yieldParams); err != nil {
+								return false
+							}
+							n.anc.gen = rangeFunc
 						case reflect.Map:
 							n.anc.gen = rangeMap
 							ityp := valueTOf(reflect.TypeOf((*reflect.MapIter)(nil)))
@@ -207,6 +267,36 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 						n.anc.gen = rangeInt
 						sc.add(sc.getType("int"))
 						ktyp = sc.getType("int")
+					case funcT:
+						// Range over func (Go 1.23+ iterator sequence).
+						sc.add(rangeFuncStateType())
+						yieldParams, ok := seqYieldParams(o.typ)
+						if !ok {
+							err = o.cfgErrorf("cannot range over %s (value of type %s)", rangeSeqName(o), o.typ.id())
+							return false
+						}
+						if ktyp, vtyp, err = rangeIterTypes(sc, o, len(n.anc.child) == 4, k, yieldParams); err != nil {
+							return false
+						}
+						n.anc.gen = rangeFunc
+					}
+
+					// For the assign form (for k, v = range ...), capture any
+					// pre-existing variables of the same name, so the loop
+					// variables below can alias them instead of shadowing them.
+					// This makes post-loop reads observe the last iteration
+					// value, as in gc.
+					if n.anc.action == aRangeAssign {
+						if k.ident != "_" {
+							if s, _, ok := sc.lookup(k.ident); ok {
+								outerK = s
+							}
+						}
+						if v != nil && v.ident != "_" {
+							if s, _, ok := sc.lookup(v.ident); ok {
+								outerV = s
+							}
+						}
 					}
 
 					kindex := sc.add(ktyp)
@@ -233,19 +323,34 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 				lk := n.child[0]
 				if rangek != nil {
 					lk.ident = rangek.ident
-					lk.typ = rangek.typ
-					kindex := sc.add(lk.typ)
-					sc.sym[lk.ident] = &symbol{index: kindex, kind: varSym, typ: lk.typ}
-					lk.findex = kindex
+					if outerK != nil {
+						// Assign form with a pre-existing variable: alias the
+						// outer slot instead of allocating a shadowing one, so
+						// writes (and post-loop reads) hit the outer variable.
+						lk.typ = outerK.typ
+						lk.findex = outerK.index
+						sc.sym[lk.ident] = &symbol{index: outerK.index, kind: varSym, typ: outerK.typ}
+					} else {
+						lk.typ = rangek.typ
+						kindex := sc.add(lk.typ)
+						sc.sym[lk.ident] = &symbol{index: kindex, kind: varSym, typ: lk.typ}
+						lk.findex = kindex
+					}
 					lk.gen = loopVarKey
 				}
 				lv := n.child[1]
 				if rangev != nil {
 					lv.ident = rangev.ident
-					lv.typ = rangev.typ
-					vindex := sc.add(lv.typ)
-					sc.sym[lv.ident] = &symbol{index: vindex, kind: varSym, typ: lv.typ}
-					lv.findex = vindex
+					if outerV != nil {
+						lv.typ = outerV.typ
+						lv.findex = outerV.index
+						sc.sym[lv.ident] = &symbol{index: outerV.index, kind: varSym, typ: outerV.typ}
+					} else {
+						lv.typ = rangev.typ
+						vindex := sc.add(lv.typ)
+						sc.sym[lv.ident] = &symbol{index: vindex, kind: varSym, typ: lv.typ}
+						lv.findex = vindex
+					}
 					lv.gen = loopVarVal
 				}
 			}
@@ -270,10 +375,7 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 				if c.kind != labeledStmt {
 					continue
 				}
-				label := c.child[0].ident
-				sym := &symbol{kind: labelSym, node: c, index: -1}
-				sc.sym[label] = sym
-				c.sym = sym
+				defineLabelSym(sc, c)
 			}
 			// If block is the body of a function, get declared variables in current scope.
 			// This is done in order to add the func signature symbols into sc.sym,
@@ -306,6 +408,25 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 
 		case caseClause:
 			sc = sc.pushBloc()
+			// Pre-define labels in case clauses too (as done for blocks
+			// below), as labeled statements can appear directly in a case
+			// body without an enclosing block. Case bodies are wrapped in
+			// a caseBody node, so scan one level deeper as well.
+			for _, c := range n.child {
+				if c.kind == caseBody {
+					for _, b := range c.child {
+						if b.kind != labeledStmt {
+							continue
+						}
+						defineLabelSym(sc, b)
+					}
+					continue
+				}
+				if c.kind != labeledStmt {
+					continue
+				}
+				defineLabelSym(sc, c)
+			}
 			if sn := n.anc.anc; sn.kind == typeSwitch && sn.child[1].action == aAssign {
 				// Type switch clause with a var defined in switch guard.
 				var typ *itype
@@ -335,9 +456,39 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 
 		case commClauseDefault:
 			sc = sc.pushBloc()
+			for _, c := range n.child {
+				if c.kind == caseBody {
+					for _, b := range c.child {
+						if b.kind != labeledStmt {
+							continue
+						}
+						defineLabelSym(sc, b)
+					}
+					continue
+				}
+				if c.kind != labeledStmt {
+					continue
+				}
+				defineLabelSym(sc, c)
+			}
 
 		case commClause:
 			sc = sc.pushBloc()
+			for _, c := range n.child {
+				if c.kind == caseBody {
+					for _, b := range c.child {
+						if b.kind != labeledStmt {
+							continue
+						}
+						defineLabelSym(sc, b)
+					}
+					continue
+				}
+				if c.kind != labeledStmt {
+					continue
+				}
+				defineLabelSym(sc, c)
+			}
 			if len(n.child) > 0 && n.child[0].action == aAssign {
 				ch := n.child[0].child[1].child[0]
 				var typ *itype
@@ -361,6 +512,14 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 				// Get type from 1st child.
 				if n.typ, err = nodeType(interp, sc, n.child[0]); err != nil {
 					return false
+				}
+				if n.typ != nil && n.typ.incomplete {
+					// A recursive generic instantiation cannot converge in a
+					// single nodeType pass, and structType-direct instances
+					// never pend methods themselves, so field-instance pending
+					// has no trigger. Deep-refresh cycle-aware: completes
+					// whatever is ready and compiles pending innermost-first.
+					ensureCompiled(interp, n.typ, map[*itype]bool{})
 				}
 				// Indicate that the first child is the type.
 				n.nleft = 1
@@ -421,6 +580,13 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 						if err != nil {
 							return false
 						}
+						if n.typ != nil && n.typ.incomplete {
+							// Defer compilation until dependencies complete;
+							// compiling now would frame against an incomplete
+							// type. Retried below once the type settles.
+							pendMethod(n.typ, pendingMethod{scope: nod.scope, node: nod, types: lt})
+							continue
+						}
 						if _, err = interp.cfg(gm, sc, sc.pkgID, sc.pkgName); err != nil {
 							return false
 						}
@@ -428,6 +594,9 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 							return false
 						}
 						n.typ.addMethod(gm)
+					}
+					if n.typ != nil && n.typ.incomplete {
+						ensureCompiled(interp, n.typ, map[*itype]bool{})
 					}
 					n.nleft = 1 // Indictate the type of composite literal.
 				}
@@ -474,9 +643,16 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 			fallthrough
 
 		case funcDecl:
-			// Do not allow function declarations without body.
+			// Do not allow function declarations without body, except
+			// //go:linkname declarations (assembly or linknamed symbols
+			// implemented elsewhere): skip code generation so importing
+			// succeeds; calling them fails cleanly at the use site.
 			if len(n.child) < 4 {
-				err = n.cfgErrorf("missing function body")
+				if !hasLinknameDirective(interp, n) {
+					err = n.cfgErrorf("missing function body")
+					return false
+				}
+				n.gen = nop
 				return false
 			}
 			n.val = n
@@ -1018,6 +1194,34 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 				// A function indexed by a type means an instantiated generic function.
 				c1 := n.child[1]
 				if !c1.isType(sc) {
+					if isGeneric(t) {
+						// An explicit type argument which can never denote a type
+						// is rejected now, as gc does, rather than silently
+						// ignored in favor of inference. Unresolved identifiers
+						// keep the lenient path: they may be type parameters
+						// resolved at instantiation, and undefined names are
+						// reported downstream.
+						switch {
+						case c1.kind == identExpr:
+							if sym, _, found := sc.lookup(c1.ident); found && sym.kind != typeSym {
+								err = c1.cfgErrorf("%s is not a type", c1.ident)
+								return
+							}
+						case c1.kind == basicLit:
+							err = c1.cfgErrorf("%s is not a type", c1.ident)
+							return
+						case c1.kind == selectorExpr:
+							// A qualified name which resolves to a non-type symbol
+							// is rejected now, as gc does. Names which do not
+							// resolve stay on the lenient path: they may be type
+							// parameters resolved at instantiation, and undefined
+							// names are reported downstream.
+							if sel := qualifiedNonType(c1, sc); sel != "" {
+								err = c1.cfgErrorf("%s is not a type", sel)
+								return
+							}
+						}
+					}
 					n.typ = t
 					return
 				}
@@ -1274,14 +1478,23 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 				if op, ok := constBltn[bname]; ok {
 					op(n)
 				}
+				// Operand of a const-evaluated unsafe builtin is never evaluated
+				// (gc parity): nop the whole operand subtree. Dense literals
+				// additionally skip frame registration (compositeLitExpr case).
+				if bname == bltnSizeof || bname == bltnAlignof || bname == bltnOffsetof {
+					for _, a := range n.child[1:] {
+						a.Walk(func(x *node) bool { x.gen = nop; return true }, nil)
+					}
+				}
 
 			case c0.isType(sc):
 				// Type conversion expression
-				c1 := n.child[1]
+				var c1 *node
 				switch len(n.child) {
 				case 1:
 					err = n.cfgErrorf("missing argument in conversion to %s", c0.typ.id())
 				case 2:
+					c1 = n.child[1]
 					err = check.conversion(c1, c0.typ)
 				default:
 					err = n.cfgErrorf("too many arguments in conversion to %s", c0.typ.id())
@@ -1356,7 +1569,10 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 			default:
 				// The call may be on a generic function. In that case, replace the
 				// generic function AST by an instantiated one before going further.
-				if isGeneric(c0.typ) {
+				if c0.typ == nil {
+					err = c0.cfgErrorf("nil type for function call: likely generic type error")
+					break
+				} else if isGeneric(c0.typ) {
 					fun := c0.typ.node.anc
 					var g *node
 					var types []*itype
@@ -1446,6 +1662,19 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 			n.lastChild().tnext = n.anc.anc // exit node is selectStmt
 
 		case compositeLitExpr:
+			// Operand of a const-evaluated unsafe builtin (Sizeof, Alignof,
+			// Offsetof) is never evaluated (gc parity): skip code generation
+			// AND frame registration, as run() materializes every scope type
+			// via reflect.New (fatal for dense array types).
+			if p := n.anc; p != nil && p.kind == callExpr && len(p.child) > 0 {
+				if f := p.child[0]; f.kind == selectorExpr && len(f.child) > 1 && f.child[0].ident == "unsafe" {
+					if id := f.child[1].ident; id == "Sizeof" || id == "Alignof" || id == "Offsetof" {
+						n.gen = nop
+						n.findex = notInFrame
+						break
+					}
+				}
+			}
 			wireChild(n)
 
 			child := n.child
@@ -1585,6 +1814,12 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 			}
 			n.start = init.start
 			body.start = body.child[0] // loopvar
+			if len(body.child) == 1 {
+				// Empty body (only the synthetic loopvar above): skip it,
+				// else the condition wires to a no-exec node and a true
+				// condition silently ends the function with zero values.
+				body.start = post.start
+			}
 			if cond.rval.IsValid() {
 				// Condition is known at compile time, bypass test.
 				if cond.rval.Bool() {
@@ -1885,6 +2120,10 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 				if s, ok := interp.binPkg[pkg][name]; ok {
 					if isBinType(s) {
 						n.typ = valueTOf(s.Type().Elem())
+						// A type carries no runtime value; registering a frame
+						// slot for it would materialize huge types (e.g. an
+						// array) at function entry.
+						n.findex = notInFrame
 					} else {
 						n.typ = valueTOf(fixPossibleConstType(s.Type()), withUntyped(isValueUntyped(s)))
 						n.rval = s
@@ -1906,6 +2145,13 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 					if sym.global {
 						n.level = globalFrame
 					}
+					if sym.kind == typeSym {
+						// A type carries no runtime value; registering a frame
+						// slot for it would materialize huge array types
+						// (e.g. libc.RawMem, 2^50-1 bytes) at function entry
+						// via reflect.New, OOMing the host.
+						n.findex = notInFrame
+					}
 					n.val = sym.node
 					n.gen = nop
 					n.action = aGetSym
@@ -1921,12 +2167,12 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 				if ti := n.typ.lookupField(n.child[1].ident); len(ti) > 0 {
 					if isStruct(n.typ) {
 						// If a method of the same name exists, use it if it is shallower than the struct field.
-						// if method's depth is the same as field's, this is an error.
+						// if method's depth is the same as field's depth (len(ti)-1), this is an error.
 						d := n.typ.methodDepth(n.child[1].ident)
-						if d >= 0 && d < len(ti) {
+						if d >= 0 && d < len(ti)-1 {
 							goto tryMethods
 						}
-						if d == len(ti) {
+						if d == len(ti)-1 {
 							err = n.cfgErrorf("ambiguous selector: %s", n.child[1].ident)
 							break
 						}
@@ -1960,12 +2206,12 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 					lind = append(lind, s.Index...)
 					if isStruct(n.typ) {
 						// If a method of the same name exists, use it if it is shallower than the struct field.
-						// if method's depth is the same as field's, this is an error.
+						// if method's depth is the same as field's depth (len(lind)-1), this is an error.
 						d := n.typ.methodDepth(n.child[1].ident)
-						if d >= 0 && d < len(lind) {
+						if d >= 0 && d < len(lind)-1 {
 							goto tryMethods
 						}
-						if d == len(lind) {
+						if d == len(lind)-1 {
 							err = n.cfgErrorf("ambiguous selector: %s", n.child[1].ident)
 							break
 						}
@@ -2052,6 +2298,15 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 			case n.child[0].isType(sc):
 				// pointer type expression
 				n.gen = nop
+				if n.child[0].typ == nil {
+					if n.child[0].typ, err = nodeType(interp, sc, n.child[0]); err != nil {
+						break
+					}
+					if n.child[0].typ == nil {
+						err = n.cfgErrorf("unresolved generic type %s", n.child[0].ident)
+						break
+					}
+				}
 				n.typ = ptrOf(n.child[0].typ)
 			default:
 				// dereference expression
@@ -2067,7 +2322,19 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 				} else {
 					n.typ = c0.typ.val
 				}
-				n.findex = sc.add(n.typ)
+				if n.typ.cat == arrayT && isSliceDerefOperand(n) {
+					// Slicing a dereferenced array pointer, e.g.
+					// (*(*RawMem)(unsafe.Pointer(s)))[:n:n], needs no array-typed
+					// frame slot: the sliceExpr case bypasses this deref node and slices
+					// the pointer directly (genValueArray dereferences pointer operands
+					// itself). Registering the slot would allocate the whole array at
+					// function entry via reflect.New, fatal for huge arrays
+					// (modernc.org/libc RawMem is 2^50-1 bytes, OOMing the host).
+					n.findex = notInFrame
+					n.gen = nop
+				} else {
+					n.findex = sc.add(n.typ)
+				}
 			}
 
 		case typeSwitch:
@@ -2217,6 +2484,26 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 			}
 
 		case sliceExpr:
+			// Slicing the dereference of an array pointer, e.g.
+			// (*(*RawMem)(unsafe.Pointer(s)))[:n:n], registers a frame slot for the
+			// whole array type (starExpr does sc.add(arrayT)), which is fatal for huge
+			// arrays: modernc.org/libc RawMem is 2^50-1 bytes, OOMing the host at
+			// function entry via reflect.New. Slicing a pointer to array is defined
+			// as slicing its dereference, and genValueArray already dereferences
+			// pointer operands, so use the pointer directly and drop the redundant
+			// deref node (looking through parenExpr wrappers, which yaegi keeps as
+			// nodes). Provably identical, including the nil-pointer panic.
+			if len(n.child) > 0 {
+				op := n.child[0]
+				for op.kind == parenExpr && len(op.child) == 1 {
+					op = op.child[0]
+				}
+				if op.kind == starExpr && op.typ != nil && op.typ.cat == arrayT &&
+					len(op.child) == 1 && op.child[0].typ != nil && op.child[0].typ.cat == ptrT {
+					op.child[0].anc = n
+					n.child[0] = op.child[0]
+				}
+			}
 			wireChild(n)
 
 			err = check.sliceExpr(n)
@@ -2433,6 +2720,18 @@ func compDefineX(sc *scope, n *node) error {
 //	return false
 // }
 
+// isSliceDerefOperand reports whether n is the operand of a slice expression,
+// looking through parenExpr wrappers. The sliceExpr case bypasses such a deref
+// node (genValueArray dereferences pointer operands itself), so the deref
+// needs no frame slot of its own.
+func isSliceDerefOperand(n *node) bool {
+	top := n
+	for top.anc != nil && top.anc.kind == parenExpr {
+		top = top.anc
+	}
+	return top.anc != nil && top.anc.kind == sliceExpr && len(top.anc.child) > 0 && top.anc.child[0] == top
+}
+
 func childPos(n *node) int {
 	for i, c := range n.anc.child {
 		if n == c {
@@ -2547,25 +2846,79 @@ func genGlobalVarDecl(nodes []*node, sc *scope) (*node, error) {
 	return varNode, nil
 }
 
-func getVarDependencies(nod *node, sc *scope) (deps []*node) {
-	nod.Walk(func(n *node) bool {
-		if n.kind != identExpr {
-			return true
+func getVarDependencies(varNode *node, _ *scope) (deps []*node) {
+	seenDep := map[*node]bool{}
+	addDep := func(target *node) {
+		if target == nil || target == varNode || seenDep[target] {
+			return
 		}
-		// Process ident nodes, and avoid false dependencies.
-		if n.anc.kind == selectorExpr && childPos(n) == 1 {
+		seenDep[target] = true
+		deps = append(deps, target)
+	}
+
+	visitedFunc := map[*node]bool{}
+	queue := []*node{varNode}
+
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+		if visitedFunc[current] {
+			continue
+		}
+		// Only func bodies are marked visited; the initial varNode may
+		// reappear as a dependency target but must still be walked once.
+		if current != varNode {
+			visitedFunc[current] = true
+		}
+
+		var pendingFunc []*node
+		current.Walk(func(candidate *node) bool {
+			// Skip nested function definitions unless they are
+			// immediately invoked; their bodies do not run at init.
+			if candidate != current && (candidate.kind == funcLit || candidate.kind == funcDecl) {
+				if candidate.anc != nil && candidate.anc.kind == callExpr && childPos(candidate) == 0 {
+					pendingFunc = append(pendingFunc, candidate)
+				}
+				return false
+			}
+			if candidate.kind != identExpr {
+				return true
+			}
+			// Avoid false dependencies on selector field names.
+			if candidate.anc != nil && candidate.anc.kind == selectorExpr && childPos(candidate) == 1 {
+				return false
+			}
+			lookupSym := candidate.sym
+			if lookupSym == nil {
+				// Definition site (param, func name, local define) or
+				// unresolved: not a use, so no dependency edge. Skipping
+				// avoids mistaking a param name for a same-named global.
+				return false
+			}
+			sym := lookupSym // A call to a package-level function pulls the transitive
+			// globals its body touches (gc init-order: X = f() depends
+			// on what f reads, recursively). A mere reference to the
+			// function value does not execute it, so it adds no edge.
+			isCallee := candidate.anc != nil && candidate.anc.kind == callExpr && childPos(candidate) == 0
+			if sym.kind == funcSym && sym.node != nil {
+				if isCallee && !visitedFunc[sym.node] {
+					pendingFunc = append(pendingFunc, sym.node)
+				}
+				return false
+			}
+			if sym.kind != varSym || !sym.global || sym.node == varNode {
+				return false
+			}
+			addDep(sym.node)
 			return false
+		}, nil)
+
+		for _, fn := range pendingFunc {
+			if !visitedFunc[fn] {
+				queue = append(queue, fn)
+			}
 		}
-		sym, _, ok := sc.lookup(n.ident)
-		if !ok {
-			return false
-		}
-		if sym.kind != varSym || !sym.global || sym.node == nod {
-			return false
-		}
-		deps = append(deps, sym.node)
-		return false
-	}, nil)
+	}
 	return deps
 }
 
@@ -2601,6 +2954,49 @@ func getDefault(n *node) int {
 
 func isBinType(v reflect.Value) bool { return v.IsValid() && v.Kind() == reflect.Ptr && v.IsNil() }
 
+// qualifiedNonType reports whether a selector expression used as an
+// explicit generic type argument resolves to a non-type symbol, which gc
+// rejects as "not a type". It returns the qualified name when the
+// selector qualifier denotes an imported package and the selected member
+// exists there without denoting a type, else "" (unresolvable names keep
+// the lenient inference path: they may be type parameters resolved at
+// instantiation, and undefined names are reported downstream). Lookup
+// mirrors the selectorExpr case of isType, including the suffixed
+// package form used for dot-import collisions.
+func qualifiedNonType(n *node, sc *scope) string {
+	if n.kind != selectorExpr || len(n.child) != 2 {
+		return ""
+	}
+	pkg, name := n.child[0].ident, n.child[1].ident
+	if name == "" {
+		return ""
+	}
+	baseName := path.Base(n.interp.fset.Position(n.pos).Filename)
+	suffixedPkg := path.Join(pkg, baseName)
+	sym, _, ok := sc.lookup(suffixedPkg)
+	if !ok {
+		sym, _, ok = sc.lookup(pkg)
+		if !ok {
+			return ""
+		}
+	}
+	if sym.kind != pkgSym {
+		return ""
+	}
+	path := sym.typ.path
+	if p, ok := n.interp.binPkg[path]; ok {
+		if v, found := p[name]; found && !isBinType(v) {
+			return pkg + "." + name
+		}
+	}
+	if p, ok := n.interp.srcPkg[path]; ok {
+		if s := p[name]; s != nil && s.kind != typeSym {
+			return pkg + "." + name
+		}
+	}
+	return ""
+}
+
 // isType returns true if node refers to a type definition, false otherwise.
 func (n *node) isType(sc *scope) bool {
 	switch n.kind {
@@ -2632,9 +3028,24 @@ func (n *node) isType(sc *scope) bool {
 			return true // Imported source type
 		}
 	case identExpr:
-		return sc.getType(n.ident) != nil
+		sym, _, found := sc.lookup(n.ident)
+		if found {
+			return sym.kind == typeSym
+		}
+		// note: in case of generic functions, the type might not exist within
+		// the scope where the generic function was defined, so we
+		// fall back on comparing the scopes: anything out of scope is assumed
+		// to be a type.
+		if n.typ == nil || n.typ.scope == nil {
+			return false
+		}
+		return n.typ.scope.pkgID != sc.pkgID
 	case indexExpr:
 		// Maybe a generic type.
+		sym, _, ok := sc.lookup(n.child[0].ident)
+		return ok && sym.kind == typeSym
+	case indexListExpr:
+		// Maybe a generic type with multiple parameters.
 		sym, _, ok := sc.lookup(n.child[0].ident)
 		return ok && sym.kind == typeSym
 	}
@@ -2900,6 +3311,200 @@ func isRegularCall(n *node) bool {
 	return isCall(n) && n.child[0].typ.cat == funcT
 }
 
+// isRangeFuncLoop reports whether loopNode (a rangeStmt) ranges over a
+// function sequence, i.e. whether the range expression type has the
+// func(yield func(...) bool) shape handled by the rangeFunc generator.
+func isRangeFuncLoop(loopNode *node) bool {
+	var seqNode *node
+	switch len(loopNode.child) {
+	case 4:
+		seqNode = loopNode.child[2]
+	case 3:
+		seqNode = loopNode.child[1]
+	default:
+		return false
+	}
+	if seqNode.typ == nil {
+		return false
+	}
+	_, ok := seqYieldParams(seqNode.typ)
+	return ok
+}
+
+// markRangeFlow wraps loop back edges and loop escapes in range-over-func
+// bodies so the runtime can tell iteration end from loop exit without
+// relying on exec code pointers, which setExec trampolines and nop
+// indirections alias across nodes. It runs inside setExec right after the
+// node generator, hence before any predecessor captures the exec, so the
+// chain always carries wrapped execs. Back edge sources (nodes edged to
+// the loop) return the stable rangeFuncMark; outside-targeted
+// break/continue/goto record their target in the per-execution state slot
+// and return rangeFuncEscape. Nodes inside nested functions, loops or
+// select statements are excluded: their control flow is consumed locally
+// and never surfaces to the outer iteration stepping.
+func markRangeFlow(n *node) {
+	if n.tnext == nil && n.fnext == nil {
+		return
+	}
+	loopNode := rangeFlowLoop(n)
+	if loopNode == nil {
+		return
+	}
+	if n.tnext == loopNode || n.fnext == loopNode {
+		// The loop variable idents (entry initializers, not back edges)
+		// always edge to the loop; excluding them keeps loop entry intact.
+		if n == loopNode.child[0] || (len(loopNode.child) == 4 && n == loopNode.child[1]) {
+			return
+		}
+		if n.exec == nil {
+			return
+		}
+		inner := n.exec
+		n.exec = func(flowFrame *frame) bltn {
+			inner(flowFrame)
+			return rangeFuncMark
+		}
+		return
+	}
+	switch n.kind {
+	case breakStmt, continueStmt, gotoStmt:
+		target := n.tnext
+		if target == nil || !outsideRangeBody(target, loopNode) {
+			return
+		}
+		if n.exec == nil {
+			return
+		}
+		stateIndex := loopNode.child[0].findex - 1
+		inner := n.exec
+		n.exec = func(flowFrame *frame) bltn {
+			escapeTarget := inner(flowFrame)
+			flowFrame.data[stateIndex].Interface().(*rangeFuncState).escaped = true
+			flowFrame.data[stateIndex].Interface().(*rangeFuncState).escapeTarget = escapeTarget
+			return rangeFuncEscape
+		}
+	}
+}
+
+// rangeFlowLoop returns the range-over-func loop node whose body directly
+// contains n, or nil. Ancestor functions, loops and select statements form
+// boundaries: control flow inside them never reaches the outer iteration
+// stepping (inner loops consume it, closures own their frame).
+func rangeFlowLoop(n *node) *node {
+	for parent := n.anc; parent != nil; parent = parent.anc {
+		switch parent.kind {
+		case rangeStmt:
+			if isRangeFuncLoop(parent) {
+				return parent
+			}
+			return nil
+		case forStmt0, forStmt1, forStmt2, forStmt3, forStmt4, forStmt5, forStmt6, forStmt7, forRangeStmt, selectStmt, funcLit, funcDecl:
+			return nil
+		}
+	}
+	return nil
+}
+
+// outsideRangeBody reports whether target lies outside the body block of
+// the given range-over-func loop node.
+func outsideRangeBody(target, loopNode *node) bool {
+	var bodyNode *node
+	if len(loopNode.child) == 4 {
+		bodyNode = loopNode.child[3]
+	} else {
+		bodyNode = loopNode.child[2]
+	}
+	for parent := target; parent != nil; parent = parent.anc {
+		if parent == bodyNode {
+			return false
+		}
+	}
+	return true
+}
+
+// rangeSeqName renders the range expression for diagnostics, falling back
+// to a generic label when the expression has no identifier (e.g. a call).
+func rangeSeqName(seqNode *node) string {
+	if seqNode.ident != "" {
+		return seqNode.ident
+	}
+	return "expression"
+}
+
+// seqYieldParams returns the yield function parameter types if seqType is a
+// range-over-func sequence type, i.e. a func taking a single yield function
+// (itself taking up to 2 params and returning bool) and returning nothing.
+// It handles interpreted func types (funcT) and binary func types (valueT).
+func seqYieldParams(seqType *itype) ([]*itype, bool) {
+	if seqType.cat == funcT {
+		if len(seqType.arg) != 1 || len(seqType.ret) != 0 {
+			return nil, false
+		}
+		yieldType := seqType.arg[0]
+		if yieldType.cat != funcT || len(yieldType.arg) > 2 || len(yieldType.ret) != 1 {
+			return nil, false
+		}
+		yieldResult := yieldType.ret[0]
+		if yieldResult.cat != boolT && !(yieldResult.cat == valueT && yieldResult.rtype.Kind() == reflect.Bool) {
+			return nil, false
+		}
+		return yieldType.arg, true
+	}
+	if seqType.cat == valueT && seqType.rtype.Kind() == reflect.Func {
+		seqReflect := seqType.rtype
+		if seqReflect.NumIn() != 1 || seqReflect.NumOut() != 0 {
+			return nil, false
+		}
+		yieldReflect := seqReflect.In(0)
+		if yieldReflect.Kind() != reflect.Func || yieldReflect.NumIn() > 2 || yieldReflect.NumOut() != 1 {
+			return nil, false
+		}
+		if yieldReflect.Out(0).Kind() != reflect.Bool {
+			return nil, false
+		}
+		yieldParams := make([]*itype, yieldReflect.NumIn())
+		for i := range yieldParams {
+			yieldParams[i] = valueTOf(yieldReflect.In(i))
+		}
+		return yieldParams, true
+	}
+	return nil, false
+}
+
+// rangeIterTypes validates the number of iteration variables against the
+// yield parameter count, following gc: 2 variables require 2 yield params,
+// 1 variable requires at least 1, and ranging a 0-param yield with variables
+// is rejected. A blank single key (including the synthetic one inserted for
+// `for range seq`) counts as zero variables. It returns the key/value
+// iteration types used for the loop variable slots.
+func rangeIterTypes(sc *scope, seqNode *node, twoVars bool, keyNode *node, yieldParams []*itype) (*itype, *itype, error) {
+	numVars := 0
+	switch {
+	case twoVars:
+		numVars = 2
+	case keyNode.ident != "_":
+		numVars = 1
+	}
+	numYield := len(yieldParams)
+	seqName := rangeSeqName(seqNode)
+	seqID := seqNode.typ.id()
+	switch {
+	case numYield == 0 && numVars > 0:
+		return nil, nil, seqNode.cfgErrorf("range over %s (value of type %s) permits no iteration variables", seqName, seqID)
+	case numYield == 1 && numVars > 1:
+		return nil, nil, seqNode.cfgErrorf("range over %s (value of type %s) permits only one iteration variable", seqName, seqID)
+	}
+	keyType := sc.getType("bool") // Dummy slot type for `for range` over a 0-yield sequence.
+	var valType *itype
+	if numYield > 0 {
+		keyType = yieldParams[0]
+	}
+	if twoVars {
+		valType = yieldParams[1]
+	}
+	return keyType, valType, nil
+}
+
 func variadicPos(n *node) int {
 	if len(n.child[0].typ.arg) == 0 {
 		return -1
@@ -2958,7 +3563,17 @@ func setExec(n *node) {
 				set(n.fnext)
 			}
 		}
+		if n.gen == nil {
+			// Last-resort guard: every cfg path is expected to set gen
+			// (many intentionally to nop, e.g. const-folded nodes), so
+			// reaching here means a node kind without a generator. Keep
+			// exec defined via nop rather than failing loud, so the CFG
+			// walk never dereferences a nil exec. Pinned by
+			// TestSetExecNilGenFallback.
+			n.gen = nop
+		}
 		n.gen(n)
+		markRangeFlow(n)
 	}
 
 	set(n)
@@ -3017,6 +3632,269 @@ func compositeGenerator(n *node, typ *itype, rtyp reflect.Type) (gen bltnGenerat
 		}
 	}
 	return gen
+}
+
+// embeddedFieldNames returns the reflect field names which correspond to
+// embedded struct fields of an interpreted struct type. Interpreted struct
+// types built by refType mark Anonymous only for single-field structs
+// (golang/go#15924 workaround, see type.go), so multi-field holders report
+// Anonymous == false even for genuinely embedded fields; the itype embed
+// flags (set at source level) stay correct. Both the source name and its
+// exported (reflect) form are collected, as unexported embedded fields are
+// stored mangled by exportName. It returns nil when t does not resolve to
+// an interpreted struct type (e.g. binary types, whose Anonymous flags are
+// trustworthy, or interfaces), in which case callers fall back to the
+// reflect-only rule.
+func embeddedFieldNames(t *itype) map[string]bool {
+	for t != nil && (t.cat == ptrT || t.cat == linkedT) {
+		t = t.val
+	}
+	if t == nil || t.cat != structT {
+		return nil
+	}
+	names := map[string]bool{}
+	for _, f := range t.field {
+		if !f.embed {
+			continue
+		}
+		names[f.name] = true
+		names[exportName(f.name)] = true
+		if n, ok := strings.CutPrefix(f.name, "*"); ok {
+			names[n] = true
+			names[exportName(n)] = true
+		}
+	}
+	return names
+}
+
+// fieldItype returns the itype of the i-th struct field when the reflect
+// field order matches the itype field order, or nil otherwise (order
+// mismatch, or no itype guidance at this level). A nil result makes the
+// walker fall back to the reflect-only rule for that field's subtree.
+func fieldItype(ftyps []*itype, i int) *itype {
+	if ftyps == nil || i < 0 || i >= len(ftyps) {
+		return nil
+	}
+	return ftyps[i]
+}
+
+// isEmbeddedFieldName is the reflect-only fallback for levels without
+// itype guidance (binary or unknown types, whose Anonymous flags are
+// trustworthy). It matches the Go rule that an embedded field's name is
+// its type base name (also trying the exported form, as unexported
+// interpreted fields are stored mangled by exportName). It only runs where
+// the type checker already resolved a promoted method expression, so a
+// same-named explicit field cannot falsely match (it would collide with
+// the embedded one).
+func isEmbeddedFieldName(f reflect.StructField) bool {
+	if f.Anonymous {
+		return true
+	}
+	t := f.Type
+	for t.Kind() == reflect.Ptr {
+		t = t.Elem()
+	}
+	name := t.Name()
+	if name == "" {
+		return false
+	}
+	return f.Name == name || f.Name == exportName(name)
+}
+
+// digPromoted resolves the promoted receiver of a method expression.
+// When the method is declared on an embedded field, the first call argument
+// carries the outer value while the interpreter frame expects the embedded
+// one, so the outer value is searched for an embedded field assignable to
+// the receiver type. The outer itype (from the method expression type)
+// guides the search: its source-level embed flags stay correct even when
+// the reflect Anonymous flags do not (see embeddedFieldNames). It reports
+// ok == false when no promoted receiver is found, in which case the caller
+// keeps the historical binding behavior.
+func digPromoted(src reflect.Value, recv reflect.Type, outer *itype) (reflect.Value, bool) {
+	if !src.IsValid() || recv == nil || src.Type().AssignableTo(recv) {
+		return src, true
+	}
+	type candidate struct {
+		v reflect.Value
+		t *itype
+	}
+	seen := map[reflect.Type]bool{}
+	queue := []candidate{{src, outer}}
+	// No visit-count cap: each reflect type is expanded once (seen), so
+	// the walk terminates on cyclic graphs, while deep linear chains
+	// bind at any depth, as in gc (a fixed cap truncated the search and
+	// fell through to a host-panicking historical bind; native R3-CAP64).
+	for len(queue) > 0 {
+		c := queue[0]
+		queue = queue[1:]
+		v := c.v
+		for v.Kind() == reflect.Interface && !v.IsNil() {
+			v = v.Elem()
+		}
+		if v.CanInterface() {
+			if vs, ok := v.Interface().(valueInterface); ok {
+				v = vs.value
+				if !v.IsValid() {
+					return src, false
+				}
+			}
+		}
+		if v.Type().AssignableTo(recv) {
+			return v, true
+		}
+		if v.CanAddr() && v.Addr().Type().AssignableTo(recv) {
+			return v.Addr(), true
+		}
+		// Dereference pointer chains: a *Inner field promotes to an Inner
+		// value receiver by dereferencing. Elem of a non-nil pointer is
+		// addressable, so the result stays bindable.
+		dd := v
+		for dd.Kind() == reflect.Ptr && !dd.IsNil() {
+			dd = dd.Elem()
+			if dd.Type().AssignableTo(recv) {
+				return dd, true
+			}
+		}
+		t := v.Type()
+		if seen[t] {
+			continue
+		}
+		seen[t] = true
+		d := v
+		for d.Kind() == reflect.Ptr {
+			if d.IsNil() {
+				break
+			}
+			d = d.Elem()
+		}
+		if d.Kind() != reflect.Struct {
+			continue
+		}
+		// Itypes of nested levels follow the field declarations when the
+		// reflect field order matches; otherwise that level falls back to
+		// the reflect-only rule.
+		tt := c.t
+		for tt != nil && (tt.cat == ptrT || tt.cat == linkedT) {
+			tt = tt.val
+		}
+		var names map[string]bool
+		var ftyps []*itype
+		if tt != nil && tt.cat == structT {
+			names = embeddedFieldNames(tt)
+			if len(tt.field) == d.NumField() {
+				ftyps = make([]*itype, len(tt.field))
+				for i := range tt.field {
+					ftyps[i] = tt.field[i].typ
+				}
+			}
+		}
+		dt := d.Type()
+		for i := 0; i < dt.NumField(); i++ {
+			f := dt.Field(i)
+			if f.Anonymous {
+				queue = append(queue, candidate{d.Field(i), fieldItype(ftyps, i)})
+				continue
+			}
+			if names != nil {
+				if names[f.Name] {
+					queue = append(queue, candidate{d.Field(i), fieldItype(ftyps, i)})
+				}
+				continue
+			}
+			// No itype guidance at this level (binary or unknown type):
+			// Anonymous is trustworthy there; keep the historical
+			// name fallback for robustness.
+			if isEmbeddedFieldName(f) {
+				queue = append(queue, candidate{d.Field(i), nil})
+			}
+		}
+	}
+	return src, false
+}
+
+// getMethodExpr generates the value of a method expression, i.e. a method
+// used as a function with the receiver passed as first argument
+// (e.g. (*T).M). It mirrors genFunctionWrapper, except that the receiver
+// is bound from the first call argument rather than from a receiver node.
+func getMethodExpr(n *node) {
+	i := n.findex
+	l := n.level
+	next := getExec(n.tnext)
+	def := n.val.(*node)
+	start := def.child[3].start
+	numRet := len(def.typ.ret)
+	funcType := n.typ.TypeOf()
+	n.exec = func(f *frame) bltn {
+		getFrame(f, l).data[i] = reflect.MakeFunc(funcType, func(in []reflect.Value) []reflect.Value {
+			// Allocate and init local frame. All values to be settable and addressable.
+			fr := newFrame(f, len(def.types), f.runid())
+			d := fr.data
+			for i, t := range def.types {
+				d[i] = reflect.New(t).Elem()
+			}
+			// Bind the method expression first argument as the receiver.
+			recv := d[numRet]
+			src := in[0]
+			for {
+				vs, ok := src.Interface().(valueInterface)
+				if !ok {
+					break
+				}
+				src = vs.value
+			}
+			var outer *itype
+			if len(n.typ.arg) > 0 {
+				outer = n.typ.arg[0]
+			}
+			if dug, ok := digPromoted(src, recv.Type(), outer); ok {
+				src = dug
+			}
+			sk, dk := src.Kind(), recv.Kind()
+			switch {
+			case sk == reflect.Ptr && dk != reflect.Ptr:
+				recv.Set(src.Elem())
+			case sk != reflect.Ptr && dk == reflect.Ptr:
+				// Interior-defensive copy (native R3-001): no compiling
+				// program is known to reach this branch — direct call
+				// syntax with a non-addressable value for a pointer
+				// receiver is rejected identically to gc at compile time
+				// (valarg/guardreach probes) — but the pre-guard trim
+				// turned a wrapper-forwarded temporary into a loud host
+				// panic, so the guard stays. Do not trim: silent copies
+				// are worse than loud failures, and removing this
+				// resurrects the host panic.
+				if !src.CanAddr() {
+					tmp := reflect.New(src.Type())
+					tmp.Elem().Set(src)
+					src = tmp.Elem()
+				}
+				recv.Set(src.Addr())
+			default:
+				recv.Set(src)
+			}
+			d = d[numRet+1:]
+			// Copy function input arguments in local frame.
+			for i, arg := range in[1:] {
+				if i >= len(d) {
+					// In case of unused arg, there may be not even a frame entry allocated, just skip.
+					break
+				}
+				typ := def.typ.arg[i]
+				switch {
+				case isEmptyInterface(typ) || typ.TypeOf() == valueInterfaceType:
+					d[i].Set(arg)
+				case isInterfaceSrc(typ):
+					d[i].Set(reflect.ValueOf(valueInterface{value: arg.Elem()}))
+				default:
+					d[i].Set(arg)
+				}
+			}
+			// Interpreter code execution.
+			runCfg(start, fr, def, n)
+			return fr.data[:numRet]
+		})
+		return next
+	}
 }
 
 // matchSelectorMethod, given that n represents a selector for a method, tries
@@ -3096,11 +3974,15 @@ func matchSelectorMethod(sc *scope, n *node) (err error) {
 		if n.child[0].isType(sc) {
 			// Handle method as a function with receiver in 1st argument.
 			n.val = m
-			n.findex = notInFrame
-			n.gen = nop
+			n.gen = getMethodExpr
 			n.typ = &itype{}
 			*n.typ = *m.typ
 			n.typ.arg = append([]*itype{n.child[0].typ}, m.typ.arg...)
+			// The expression denotes a plain function: drop the method
+			// receiver marker and any cached reflect type, so the
+			// prepended receiver argument is honored.
+			n.typ.recv = nil
+			n.typ.rtype = nil
 		} else {
 			// Handle method with receiver.
 			n.gen = getMethod

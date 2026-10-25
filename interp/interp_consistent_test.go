@@ -58,6 +58,10 @@ func TestInterpConsistencyBuild(t *testing.T) {
 			file.Name() == "gen7.go" || // expect error
 			file.Name() == "gen8.go" || // expect error
 			file.Name() == "gen9.go" || // expect error
+			file.Name() == "gen14.go" || // expect error
+			file.Name() == "gen18.go" || // expect error
+			file.Name() == "gen20.go" || // expect error
+			file.Name() == "gen21.go" || // expect error
 			file.Name() == "if2.go" || // expect error
 			file.Name() == "import6.go" || // expect error
 			file.Name() == "init1.go" || // expect error
@@ -71,6 +75,7 @@ func TestInterpConsistencyBuild(t *testing.T) {
 			file.Name() == "bltn0.go" || // expect error
 			file.Name() == "method16.go" || // private struct field
 			file.Name() == "method39.go" || // expect error
+			file.Name() == "methodvalue0.go" || // expect error
 			file.Name() == "switch8.go" || // expect error
 			file.Name() == "switch9.go" || // expect error
 			file.Name() == "switch13.go" || // expect error

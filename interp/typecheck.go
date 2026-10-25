@@ -38,6 +38,9 @@ func (check typecheck) assignment(n *node, typ *itype, context string) error {
 	if n.typ == nil {
 		return n.cfgErrorf("invalid type in %s", context)
 	}
+	if err := check.methodPtrRecv(n); err != nil {
+		return err
+	}
 	if n.typ.untyped {
 		if typ == nil || isInterface(typ) {
 			if typ == nil && n.typ.cat == nilT {
@@ -98,14 +101,27 @@ func (check typecheck) addressExpr(n *node) error {
 			c0 = c0.child[1]
 			continue
 		case starExpr:
-			c0 = c0.child[0]
+			// Dereferencing a pointer always yields an addressable value, so
+			// &*p is valid and denotes p itself (as in gc), whatever p is,
+			// even the result of a call (e.g. a conversion), which on its own
+			// would not be addressable.
+			found = true
 			continue
 		case indexExpr, sliceExpr:
 			c := c0.child[0]
-			if isArray(c.typ) || isMap(c.typ) {
+			if c.typ != nil && (isArray(c.typ) || isMap(c.typ)) {
 				c0 = c
 				found = true
 				continue
+			}
+			if c.typ != nil && isPtr(c.typ) {
+				// Indexing a pointer to array auto-dereferences as (*p)[i],
+				// whose elements are always addressable (as in gc).
+				if et := c.typ.val; et != nil && isArray(et) {
+					c0 = c
+					found = true
+					continue
+				}
 			}
 		case compositeLitExpr, identExpr:
 			found = true
@@ -623,7 +639,13 @@ func (check typecheck) typeAssertionExpr(n *node, typ *itype) error {
 			return n.cfgErrorf("impossible type assertion: %s does not implement %s (missing %v method)", typ.id(), n.typ.id(), name)
 		}
 		if tm.recv != nil && tm.recv.TypeOf().Kind() == reflect.Ptr && typ.TypeOf().Kind() != reflect.Ptr {
-			return n.cfgErrorf("impossible type assertion: %s does not implement %s as %q method has a pointer receiver", typ.id(), n.typ.id(), name)
+			// Methods promoted through an embedded pointer belong to the
+			// value method set (as gc implements it: the assertion is then
+			// a dynamic check), so only methods with a direct or
+			// value-promoted pointer receiver stay static errors.
+			if _, index := typ.lookupMethod(name); !promotedThroughPtr(typ, index) {
+				return n.cfgErrorf("impossible type assertion: %s does not implement %s as %q method has a pointer receiver", typ.id(), n.typ.id(), name)
+			}
 		}
 
 		if im.cat != funcT || tm.cat != funcT {
@@ -647,6 +669,33 @@ func (check typecheck) typeAssertionExpr(n *node, typ *itype) error {
 		}
 	}
 	return nil
+}
+
+// promotedThroughPtr reports whether the method found at the given lookup
+// path in typ is promoted through an embedded pointer. gc treats such
+// methods as part of the value method set, so a type assertion to typ is a
+// dynamic check rather than a static error, even if the method is declared
+// with a pointer receiver.
+func promotedThroughPtr(typ *itype, index []int) bool {
+	cur := typ
+	for len(index) > 0 {
+		for cur != nil && cur.cat == linkedT && cur.val != nil {
+			cur = cur.val
+		}
+		if cur == nil || len(cur.field) <= index[0] {
+			return false
+		}
+		ft := cur.field[index[0]].typ
+		for ft != nil && ft.cat == linkedT && ft.val != nil {
+			ft = ft.val
+		}
+		if ft != nil && ft.cat == ptrT {
+			return true
+		}
+		cur = ft
+		index = index[1:]
+	}
+	return false
 }
 
 // conversion type checks the conversion of n to typ.
@@ -968,6 +1017,13 @@ func (check typecheck) arguments(n *node, child []*node, fun *node, ellipsis boo
 		}
 	}
 
+	if fun.typ == nil {
+		err := fun.cfgErrorf("typecheck arguments: nil function type: likely a syntax error above this point")
+		return err
+	}
+	if err := check.methodPtrRecv(fun); err != nil {
+		return err
+	}
 	var cnt int
 	for i, param := range params {
 		ellip := i == l-1 && ellipsis
@@ -1044,6 +1100,96 @@ func getArgsID(ftyp *itype) string {
 	}
 	res += ")"
 	return res
+}
+
+// methodPtrRecv rejects a method value or method call which requires a
+// pointer receiver on a non-addressable operand, matching gc:
+// "cannot call pointer method M on T". Without this static check the call
+// would silently operate on a copy, losing mutations. Method expressions,
+// binary methods and interface dispatch carry no declared pointer receiver
+// here and are unaffected, as are pointer operands, which never need an
+// addressable value.
+func (check typecheck) methodPtrRecv(s *node) error {
+	if s.action != aGetMethod || s.typ == nil || s.typ.isBinMethod {
+		return nil
+	}
+	recv := s.typ.recv
+	if recv == nil || recv.cat != ptrT {
+		return nil
+	}
+	if len(s.child) < 2 {
+		return nil
+	}
+	op := s.child[0]
+	if op.typ == nil || isPtr(op.typ) {
+		return nil
+	}
+	if isMethodOperandAddressable(op) {
+		return nil
+	}
+	tname := op.typ.name
+	if tname == "" {
+		tname = op.typ.id()
+	}
+	return s.cfgErrorf("cannot call pointer method %s on %s", s.child[1].ident, tname)
+}
+
+// isMethodOperandAddressable reports whether the operand of a selector
+// expression can be addressed, following gc addressability rules: variables,
+// pointer indirections and selectors through pointers are addressable; slice
+// indexing is addressable, array indexing follows its base; map and string
+// indexing, calls, composite literals and other computed values are not.
+func isMethodOperandAddressable(o *node) bool {
+	for o != nil {
+		if o.typ == nil {
+			return true
+		}
+		switch o.kind {
+		case parenExpr:
+			o = o.child[0]
+			continue
+		case identExpr:
+			return !isBlank(o)
+		case starExpr:
+			return true
+		case indexExpr:
+			if len(o.child) == 0 || o.child[0].typ == nil {
+				return false
+			}
+			base := o.child[0].typ
+			if isMap(base) {
+				return false
+			}
+			switch base.TypeOf().Kind() {
+			case reflect.Slice:
+				return true
+			case reflect.Array:
+				o = o.child[0]
+				continue
+			case reflect.Ptr:
+				// Indexing a pointer to array auto-dereferences, as
+				// (*p)[i], which is always addressable, as in gc.
+				if base.TypeOf().Elem().Kind() == reflect.Array {
+					return true
+				}
+				return false
+			default:
+				return false
+			}
+		case selectorExpr:
+			if len(o.child) == 0 || o.child[0].typ == nil {
+				return false
+			}
+			if isPtr(o.child[0].typ) {
+				return true
+			}
+			o = o.child[0]
+			continue
+		default:
+			return false
+		}
+	}
+	return false
 }
 
 var errCantConvert = errors.New("cannot convert")
