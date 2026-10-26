@@ -1,6 +1,5 @@
-# Fork CI: self-hosted gate for the Catalyst-oriented yaegi fork.
-# Runs on the repo-local runner registered per the dispatcher pattern:
-# one self-hosted runner per Seinra repo (actions-runner-dispatcher.ps1).
+# Fork CI: local gate for the Catalyst-oriented yaegi fork.
+# Runs on GitHub-hosted Windows (no local runner needed).
 name: fork-ci
 
 permissions:
@@ -13,7 +12,7 @@ on:
 
 jobs:
   gate:
-    runs-on: [self-hosted, windows]
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
