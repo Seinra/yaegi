@@ -1171,6 +1171,9 @@ func genInterfaceWrapper(n *node, typ reflect.Type) func(*frame) reflect.Value {
 	// As the field name was generated with a prefixed first character (in order to avoid
 	// collisions with method names), this first character is ignored in comparisons.
 	wrap := getWrapper(n, typ)
+	if wrap == nil {
+		panic(n.cfgErrorf("no interface wrapper found for %s.%s", typ.PkgPath(), typ.Name()))
+	}
 	mn := wrap.NumField() - 1
 	names := make([]string, mn)
 	methods := make([]*node, mn)
@@ -3090,6 +3093,20 @@ func loopVarFor(n *node) {
 		nv := reflect.New(fv.Type()).Elem()
 		nv.Set(fv)
 		f.data[n.findex] = nv
+		return next
+	}
+}
+
+// loopVarForEnd runs at the end of each iteration of a for loop with a
+// per-iteration variable, before the post statement: as in Go 1.22, the next
+// iteration starts from the value that the body left in the variable (the body
+// can change it, as in "i++" or "i += n").
+func loopVarForEnd(n *node) {
+	lv := n.child[0].findex
+	ixn := n.anc.child[0].child[0].findex
+	next := getExec(n.tnext)
+	n.exec = func(f *frame) bltn {
+		f.data[ixn].Set(f.data[lv])
 		return next
 	}
 }
