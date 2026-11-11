@@ -1,0 +1,9 @@
+# Conduit artifact store manifest (gitignore-lite dialect, one glob per line).
+# Agent/harness artifacts — never ship to remotes (loop-engineering Rules 14/15).
+# Every glob here is also gitignored in .gitignore (same migration); this file itself is committed.
+odd/
+.atl/
+CATALYST-FORK-BACKLOG.md
+.codegraph/
+.zvec-grep/
+.crystallize/

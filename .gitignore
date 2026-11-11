@@ -12,3 +12,5 @@ _test/tmp/
 .codegraph/
 .zvec-grep/
 .atl/
+odd/
+CATALYST-FORK-BACKLOG.md
